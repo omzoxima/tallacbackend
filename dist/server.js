@@ -30,11 +30,23 @@ app.use(express_1.default.urlencoded({ extended: true }));
 // Health check
 app.get('/health', async (req, res) => {
     try {
+        const startTime = Date.now();
         await database_1.pool.query('SELECT NOW()');
-        res.json({ status: 'ok', database: 'connected' });
+        const responseTime = Date.now() - startTime;
+        res.json({
+            status: 'ok',
+            database: 'connected',
+            responseTime: `${responseTime}ms`
+        });
     }
     catch (error) {
-        res.status(500).json({ status: 'error', database: 'disconnected' });
+        console.error('Health check failed:', error.message);
+        res.status(500).json({
+            status: 'error',
+            database: 'disconnected',
+            error: error.message,
+            code: error.code
+        });
     }
 });
 // Routes

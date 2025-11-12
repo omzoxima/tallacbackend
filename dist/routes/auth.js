@@ -61,7 +61,26 @@ router.post('/login', async (req, res) => {
     }
     catch (error) {
         console.error('Error during login:', error);
-        res.status(500).json({ error: 'Internal server error' });
+        // Check if it's a connection timeout error
+        if (error.code === 'ETIMEDOUT' || error.code === 'ECONNREFUSED' || error.message?.includes('timeout')) {
+            console.error('Database connection timeout:', error.message);
+            return res.status(503).json({
+                error: 'Database connection timeout. Please try again later.',
+                details: process.env.NODE_ENV === 'development' ? error.message : undefined
+            });
+        }
+        // Check if it's a connection error
+        if (error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED') {
+            console.error('Database connection error:', error.message);
+            return res.status(503).json({
+                error: 'Unable to connect to database. Please check your database configuration.',
+                details: process.env.NODE_ENV === 'development' ? error.message : undefined
+            });
+        }
+        res.status(500).json({
+            error: 'Internal server error',
+            details: process.env.NODE_ENV === 'development' ? error.message : undefined
+        });
     }
 });
 // Register (for development/testing)

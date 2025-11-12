@@ -30,10 +30,22 @@ app.use(express.urlencoded({ extended: true }));
 // Health check
 app.get('/health', async (req, res) => {
   try {
+    const startTime = Date.now();
     await pool.query('SELECT NOW()');
-    res.json({ status: 'ok', database: 'connected' });
-  } catch (error) {
-    res.status(500).json({ status: 'error', database: 'disconnected' });
+    const responseTime = Date.now() - startTime;
+    res.json({ 
+      status: 'ok', 
+      database: 'connected',
+      responseTime: `${responseTime}ms`
+    });
+  } catch (error: any) {
+    console.error('Health check failed:', error.message);
+    res.status(500).json({ 
+      status: 'error', 
+      database: 'disconnected',
+      error: error.message,
+      code: error.code
+    });
   }
 });
 
