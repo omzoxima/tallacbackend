@@ -1,10 +1,96 @@
 "use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
 Object.defineProperty(exports, "__esModule", { value: true });
 const database_1 = require("../config/database");
+const bcryptjs_1 = __importDefault(require("bcryptjs"));
 async function seedDatabase() {
     try {
-        console.log('🌱 Seeding database with comprehensive test data...');
-        // Insert activity statuses first
+        console.log('🧹 Cleaning all existing data...');
+        // Delete all data in reverse dependency order
+        await database_1.pool.query('DELETE FROM partner_team_members');
+        await database_1.pool.query('DELETE FROM partner_territories');
+        await database_1.pool.query('DELETE FROM tallac_partners');
+        await database_1.pool.query('DELETE FROM territory_zip_codes');
+        await database_1.pool.query('DELETE FROM territory_owners');
+        await database_1.pool.query('DELETE FROM user_territory_assignments');
+        await database_1.pool.query('DELETE FROM user_telephony_assignments');
+        await database_1.pool.query('DELETE FROM knowledge_base_files'); // Delete before users
+        await database_1.pool.query('DELETE FROM tallac_lead_contact_paths');
+        await database_1.pool.query('DELETE FROM tallac_call_logs');
+        await database_1.pool.query('DELETE FROM tallac_notes');
+        await database_1.pool.query('DELETE FROM tallac_activities');
+        await database_1.pool.query('DELETE FROM tallac_leads');
+        await database_1.pool.query('DELETE FROM tallac_contacts');
+        await database_1.pool.query('DELETE FROM tallac_organizations');
+        // Note: companies table is kept as it may be used elsewhere, but we'll ensure it doesn't block territory deletion
+        // First, set territory_id to NULL in companies to avoid foreign key constraint
+        await database_1.pool.query('UPDATE companies SET territory_id = NULL WHERE territory_id IS NOT NULL');
+        // Handle any foreign key constraints from territories to users
+        // Check if there's a user_id or created_by_id column in territories
+        await database_1.pool.query(`
+      DO $$ 
+      BEGIN
+        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='tallac_territories' AND column_name='created_by_id') THEN
+          UPDATE tallac_territories SET created_by_id = NULL WHERE created_by_id IS NOT NULL;
+        END IF;
+        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='tallac_territories' AND column_name='territory_manager_id') THEN
+          UPDATE tallac_territories SET territory_manager_id = NULL WHERE territory_manager_id IS NOT NULL;
+        END IF;
+        -- Handle territories table (if it exists separately)
+        IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='territories') THEN
+          IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='territories' AND column_name='created_by_id') THEN
+            UPDATE territories SET created_by_id = NULL WHERE created_by_id IS NOT NULL;
+          END IF;
+          IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='territories' AND column_name='user_id') THEN
+            UPDATE territories SET user_id = NULL WHERE user_id IS NOT NULL;
+          END IF;
+        END IF;
+      END $$;
+    `);
+        await database_1.pool.query('DELETE FROM tallac_territories');
+        // Delete territories table if it exists - use TRUNCATE CASCADE to handle foreign keys
+        try {
+            await database_1.pool.query('TRUNCATE TABLE territories CASCADE');
+        }
+        catch (e) {
+            // If TRUNCATE fails, try to delete after nullifying references
+            try {
+                await database_1.pool.query(`
+          DO $$ 
+          DECLARE
+            col_name text;
+          BEGIN
+            -- Find the column that references users
+            SELECT column_name INTO col_name
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name
+            WHERE tc.table_name = 'territories' 
+              AND tc.constraint_type = 'FOREIGN KEY'
+              AND tc.constraint_name = 'FK_c006aad36786c43371d7375a4de';
+            
+            IF col_name IS NOT NULL THEN
+              EXECUTE format('UPDATE territories SET %I = NULL', col_name);
+            END IF;
+            
+            DELETE FROM territories;
+          EXCEPTION WHEN OTHERS THEN
+            -- Ignore errors
+            NULL;
+          END $$;
+        `);
+            }
+            catch (e2) {
+                // Ignore
+            }
+        }
+        await database_1.pool.query('DELETE FROM telephony_lines');
+        await database_1.pool.query('DELETE FROM users');
+        console.log('✅ All data cleaned');
+        // Hash password for all users
+        const passwordHash = await bcryptjs_1.default.hash('123@tallac', 10);
+        // Insert activity statuses
         await database_1.pool.query(`
       INSERT INTO activity_statuses (status_name, description)
       VALUES 
@@ -26,617 +112,276 @@ async function seedDatabase() {
       ON CONFLICT (status_name) DO NOTHING
     `);
         console.log('✅ Call statuses ready');
-        // Insert test users
-        const usersResult = await database_1.pool.query(`
-      INSERT INTO users (email, "firstName", "lastName", "passwordHash", role, active, first_name, last_name, full_name, password_hash, is_active)
-      VALUES 
-        ('admin@tallac.io', 'Admin', 'User', '$2b$10$dummyhash', 'Sales User', true, 'Admin', 'User', 'Admin User', '$2b$10$dummyhash', true),
-        ('calvin@email.com', 'Calvin', 'M.', '$2b$10$dummyhash', 'Sales User', true, 'Calvin', 'M.', 'Calvin M.', '$2b$10$dummyhash', true),
-        ('shruti@email.com', 'Shruti', 'K.', '$2b$10$dummyhash', 'Sales User', true, 'Shruti', 'K.', 'Shruti K.', '$2b$10$dummyhash', true),
-        ('john.doe@tallac.io', 'John', 'Doe', '$2b$10$dummyhash', 'Sales User', true, 'John', 'Doe', 'John Doe', '$2b$10$dummyhash', true),
-        ('jane.smith@tallac.io', 'Jane', 'Smith', '$2b$10$dummyhash', 'Sales User', true, 'Jane', 'Smith', 'Jane Smith', '$2b$10$dummyhash', true)
-      ON CONFLICT (email) DO NOTHING
-      RETURNING id, email, full_name
-    `);
-        console.log(`✅ Inserted ${usersResult.rows.length} users`);
-        // Get user IDs
-        const adminUser = await database_1.pool.query("SELECT id FROM users WHERE email = 'admin@tallac.io'");
-        const calvinUser = await database_1.pool.query("SELECT id FROM users WHERE email = 'calvin@email.com'");
-        const shrutiUser = await database_1.pool.query("SELECT id FROM users WHERE email = 'shruti@email.com'");
-        const johnUser = await database_1.pool.query("SELECT id FROM users WHERE email = 'john.doe@tallac.io'");
-        const janeUser = await database_1.pool.query("SELECT id FROM users WHERE email = 'jane.smith@tallac.io'");
-        const adminId = adminUser.rows[0]?.id;
-        const calvinId = calvinUser.rows[0]?.id;
-        const shrutiId = shrutiUser.rows[0]?.id;
-        const johnId = johnUser.rows[0]?.id;
-        const janeId = janeUser.rows[0]?.id;
-        // Insert territories
-        const territoriesResult = await database_1.pool.query(`
-      INSERT INTO tallac_territories (territory_name, description)
-      VALUES 
-        ('Oregon', 'Oregon Territory'),
-        ('Washington', 'Washington Territory'),
-        ('California', 'California Territory'),
-        ('Florida', 'Florida Territory'),
-        ('Texas', 'Texas Territory'),
-        ('Colorado', 'Colorado Territory'),
-        ('Georgia', 'Georgia Territory'),
-        ('Illinois', 'Illinois Territory'),
-        ('Arizona', 'Arizona Territory')
-      ON CONFLICT DO NOTHING
-      RETURNING id, territory_name
-    `);
-        console.log(`✅ Inserted ${territoriesResult.rows.length} territories`);
-        // Get territory IDs
-        const getTerritoryId = async (name) => {
-            const result = await database_1.pool.query("SELECT id FROM tallac_territories WHERE territory_name = $1", [name]);
-            return result.rows[0]?.id;
-        };
-        // Insert organizations (matching company names from prospects)
-        const orgsResult = await database_1.pool.query(`
-      INSERT INTO tallac_organizations (organization_name, description)
-      VALUES 
-        ('Northern Logistics', 'Logistics and Transportation Company'),
-        ('Summit Logistics', 'Summit Logistics Services'),
-        ('Pacific Transport', 'Pacific Transportation Services'),
-        ('Coastal Carriers', 'Coastal Shipping Carriers'),
-        ('Eagle Freight', 'Eagle Freight Services'),
-        ('Mountain Express', 'Mountain Express Delivery'),
-        ('Harbor Shipping', 'Harbor Shipping Company'),
-        ('Continental Freight', 'Continental Freight Forwarding'),
-        ('West Coast Transport', 'West Coast Transportation'),
-        ('Mountain Freight', 'Mountain Freight Services'),
-        ('Coastal Logistics', 'Coastal Logistics Solutions'),
-        ('Fast Track Delivery', 'Fast Track Delivery Services')
-      ON CONFLICT DO NOTHING
-      RETURNING id, organization_name
-    `);
-        console.log(`✅ Inserted ${orgsResult.rows.length} organizations`);
-        // Get organization IDs
-        const getOrgId = async (name) => {
-            const result = await database_1.pool.query("SELECT id FROM tallac_organizations WHERE organization_name = $1", [name]);
-            return result.rows[0]?.id;
-        };
-        // Insert contacts
-        const contactsData = [
-            { name: 'Emily Chen', org: 'Northern Logistics', title: 'Director of Logistics', email: 'emily@northernlogistics.com', phone: '555-8001' },
-            { name: 'Jane Doe', org: 'Summit Logistics', title: 'Operations Director', email: 'contact@summitlogistics.com', phone: '555-2077' },
-            { name: 'John Smith', org: 'Pacific Transport', title: 'CEO', email: 'john@pacifictransport.com', phone: '555-3001' },
-            { name: 'Sarah Johnson', org: 'Coastal Carriers', title: 'VP Operations', email: 'sarah@coastalcarriers.com', phone: '555-4001' },
-            { name: 'Michael Brown', org: 'Eagle Freight', title: 'Regional Manager', email: 'michael@eaglefreight.com', phone: '555-5001' },
-            { name: 'Robert Wilson', org: 'Mountain Express', title: 'Logistics Coordinator', email: 'robert@mountainexpress.com', phone: '555-6001' },
-            { name: 'Lisa Martinez', org: 'Harbor Shipping', title: 'Procurement Manager', email: 'lisa@harborshipping.com', phone: '555-7001' },
-            { name: 'David Lee', org: 'Continental Freight', title: 'Business Development', email: 'david@continentalfreight.com', phone: '555-8001' },
+        // Insert users - one for each role
+        const usersData = [
+            { email: 'corporate.admin@tallac.io', firstName: 'Corporate', lastName: 'Admin', role: 'Corporate Admin', tallacRole: 'Corporate Admin' },
+            { email: 'business.coach@tallac.io', firstName: 'Business', lastName: 'Coach', role: 'Business Coach', tallacRole: 'Business Coach' },
+            { email: 'territory.admin@tallac.io', firstName: 'Territory', lastName: 'Admin', role: 'Territory Admin', tallacRole: 'Territory Admin' },
+            { email: 'territory.manager@tallac.io', firstName: 'Territory', lastName: 'Manager', role: 'Territory Manager', tallacRole: 'Territory Manager' },
+            { email: 'sales.user@tallac.io', firstName: 'Sales', lastName: 'User', role: 'Sales User', tallacRole: 'Sales User' },
+            { email: 'john.doe@tallac.io', firstName: 'John', lastName: 'Doe', role: 'Sales User', tallacRole: 'Sales User' },
+            { email: 'jane.smith@tallac.io', firstName: 'Jane', lastName: 'Smith', role: 'Territory Manager', tallacRole: 'Territory Manager' },
+            { email: 'mike.johnson@tallac.io', firstName: 'Mike', lastName: 'Johnson', role: 'Territory Admin', tallacRole: 'Territory Admin' },
+            { email: 'sarah.williams@tallac.io', firstName: 'Sarah', lastName: 'Williams', role: 'Business Coach', tallacRole: 'Business Coach' },
+            { email: 'david.brown@tallac.io', firstName: 'David', lastName: 'Brown', role: 'Sales User', tallacRole: 'Sales User' }
         ];
-        for (const contact of contactsData) {
-            const orgId = await getOrgId(contact.org);
+        for (const user of usersData) {
             await database_1.pool.query(`
-        INSERT INTO tallac_contacts (full_name, first_name, last_name, job_title, email, phone, organization_id)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        ON CONFLICT DO NOTHING
+        INSERT INTO users (email, first_name, last_name, full_name, password_hash, role, is_active, tallac_role, mobile_no, "firstName", "lastName", active)
+        VALUES ($1, $2, $3, $4, $5, $6, true, $7, $8, $2, $3, true)
+        ON CONFLICT (email) DO UPDATE SET
+          first_name = EXCLUDED.first_name,
+          last_name = EXCLUDED.last_name,
+          full_name = EXCLUDED.full_name,
+          password_hash = EXCLUDED.password_hash,
+          role = EXCLUDED.role,
+          tallac_role = EXCLUDED.tallac_role,
+          mobile_no = EXCLUDED.mobile_no,
+          "firstName" = EXCLUDED."firstName",
+          "lastName" = EXCLUDED."lastName",
+          active = true
       `, [
-                contact.name,
-                contact.name.split(' ')[0],
-                contact.name.split(' ')[1] || '',
-                contact.title,
-                contact.email,
-                contact.phone,
-                orgId,
+                user.email,
+                user.firstName,
+                user.lastName,
+                `${user.firstName} ${user.lastName}`,
+                passwordHash,
+                user.role,
+                user.tallacRole,
+                `555-${Math.floor(Math.random() * 9000) + 1000}`
             ]);
         }
-        console.log(`✅ Inserted ${contactsData.length} contacts`);
-        // Calculate dates for queue status
-        const today = new Date();
-        const yesterday = new Date(today);
-        yesterday.setDate(yesterday.getDate() - 1);
-        const tomorrow = new Date(today);
-        tomorrow.setDate(tomorrow.getDate() + 1);
-        const nextWeek = new Date(today);
-        nextWeek.setDate(nextWeek.getDate() + 7);
-        const lastWeek = new Date(today);
-        lastWeek.setDate(lastWeek.getDate() - 7);
-        // Get all territory and organization IDs first
-        const oregonId = await getTerritoryId('Oregon');
-        const washingtonId = await getTerritoryId('Washington');
-        const californiaId = await getTerritoryId('California');
-        const coloradoId = await getTerritoryId('Colorado');
-        const georgiaId = await getTerritoryId('Georgia');
-        const illinoisId = await getTerritoryId('Illinois');
-        const floridaId = await getTerritoryId('Florida');
-        const arizonaId = await getTerritoryId('Arizona');
-        const northernOrgId = await getOrgId('Northern Logistics');
-        const summitOrgId = await getOrgId('Summit Logistics');
-        const pacificOrgId = await getOrgId('Pacific Transport');
-        const coastalCarriersOrgId = await getOrgId('Coastal Carriers');
-        const eagleOrgId = await getOrgId('Eagle Freight');
-        const mountainExpressOrgId = await getOrgId('Mountain Express');
-        const harborOrgId = await getOrgId('Harbor Shipping');
-        const continentalOrgId = await getOrgId('Continental Freight');
-        const westCoastOrgId = await getOrgId('West Coast Transport');
-        const mountainFreightOrgId = await getOrgId('Mountain Freight');
-        const coastalLogisticsOrgId = await getOrgId('Coastal Logistics');
-        const fastTrackOrgId = await getOrgId('Fast Track Delivery');
-        // Insert comprehensive leads/prospects with queue statuses
-        const leadsData = [
-            // Queue: Overdue (callback_date < today)
-            {
-                name: 'TLEAD-00001',
-                company_name: 'Northern Logistics',
-                industry: 'Distribution',
-                status: 'New',
-                lead_owner_id: calvinId,
-                assigned_to_id: calvinId,
-                primary_contact_name: 'Emily Chen',
-                primary_title: 'Director of Logistics',
-                primary_phone: '555-8001',
-                primary_email: 'emily@northernlogistics.com',
-                city: 'Portland',
-                state: 'OR',
-                zip_code: '97201',
-                territory_id: oregonId,
-                organization_id: northernOrgId,
-                callback_date: yesterday.toISOString().split('T')[0],
-                callback_time: '14:00:00',
-            },
-            {
-                name: 'TLEAD-00002',
-                company_name: 'Summit Logistics',
-                industry: 'Warehousing',
-                status: 'Contacted',
-                lead_owner_id: shrutiId,
-                assigned_to_id: shrutiId,
-                primary_contact_name: 'Jane Doe',
-                primary_title: 'Operations Director',
-                primary_phone: '555-2077',
-                primary_email: 'contact@summitlogistics.com',
-                city: 'Denver',
-                state: 'CO',
-                zip_code: '80202',
-                territory_id: coloradoId,
-                organization_id: summitOrgId,
-                callback_date: lastWeek.toISOString().split('T')[0],
-                callback_time: '10:00:00',
-            },
-            // Queue: Today (callback_date = today)
-            {
-                name: 'TLEAD-00003',
-                company_name: 'Pacific Transport',
-                industry: 'Logistics',
-                status: 'Proposal',
-                lead_owner_id: calvinId,
-                assigned_to_id: calvinId,
-                primary_contact_name: 'John Smith',
-                primary_title: 'CEO',
-                primary_phone: '555-3001',
-                primary_email: 'john@pacifictransport.com',
-                city: 'Los Angeles',
-                state: 'CA',
-                zip_code: '90001',
-                territory_id: californiaId,
-                organization_id: pacificOrgId,
-                callback_date: today.toISOString().split('T')[0],
-                callback_time: '15:00:00',
-            },
-            {
-                name: 'TLEAD-00004',
-                company_name: 'Coastal Carriers',
-                industry: 'Shipping',
-                status: 'Interested',
-                lead_owner_id: johnId,
-                assigned_to_id: johnId,
-                primary_contact_name: 'Sarah Johnson',
-                primary_title: 'VP Operations',
-                primary_phone: '555-4001',
-                primary_email: 'sarah@coastalcarriers.com',
-                city: 'San Diego',
-                state: 'CA',
-                zip_code: '92101',
-                territory_id: californiaId,
-                organization_id: coastalCarriersOrgId,
-                callback_date: today.toISOString().split('T')[0],
-                callback_time: '16:00:00',
-            },
-            // Queue: Scheduled (callback_date > today)
-            {
-                name: 'TLEAD-00005',
-                company_name: 'Eagle Freight',
-                industry: 'Air Cargo',
-                status: 'Won',
-                lead_owner_id: shrutiId,
-                assigned_to_id: shrutiId,
-                primary_contact_name: 'Michael Brown',
-                primary_title: 'Regional Manager',
-                primary_phone: '555-5001',
-                primary_email: 'michael@eaglefreight.com',
-                city: 'Atlanta',
-                state: 'GA',
-                zip_code: '30301',
-                territory_id: georgiaId,
-                organization_id: eagleOrgId,
-                callback_date: tomorrow.toISOString().split('T')[0],
-                callback_time: '11:00:00',
-            },
-            {
-                name: 'TLEAD-00006',
-                company_name: 'Mountain Express',
-                industry: 'Express Delivery',
-                status: 'New',
-                lead_owner_id: calvinId,
-                assigned_to_id: calvinId,
-                primary_contact_name: 'Robert Wilson',
-                primary_title: 'Logistics Coordinator',
-                primary_phone: '555-6001',
-                primary_email: 'robert@mountainexpress.com',
-                city: 'Denver',
-                state: 'CO',
-                zip_code: '80201',
-                territory_id: coloradoId,
-                organization_id: mountainExpressOrgId,
-                callback_date: nextWeek.toISOString().split('T')[0],
-                callback_time: '09:00:00',
-            },
-            {
-                name: 'TLEAD-00007',
-                company_name: 'Harbor Shipping',
-                industry: 'Maritime Shipping',
-                status: 'Contacted',
-                lead_owner_id: calvinId,
-                assigned_to_id: calvinId,
-                primary_contact_name: 'Lisa Martinez',
-                primary_title: 'Procurement Manager',
-                primary_phone: '555-7001',
-                primary_email: 'lisa@harborshipping.com',
-                city: 'Seattle',
-                state: 'WA',
-                zip_code: '98101',
-                territory_id: washingtonId,
-                organization_id: harborOrgId,
-                callback_date: tomorrow.toISOString().split('T')[0],
-                callback_time: '14:00:00',
-            },
-            {
-                name: 'TLEAD-00008',
-                company_name: 'Continental Freight',
-                industry: 'Freight Forwarding',
-                status: 'Proposal',
-                lead_owner_id: johnId,
-                assigned_to_id: johnId,
-                primary_contact_name: 'David Lee',
-                primary_title: 'Business Development',
-                primary_phone: '555-8001',
-                primary_email: 'david@continentalfreight.com',
-                city: 'Chicago',
-                state: 'IL',
-                zip_code: '60601',
-                territory_id: illinoisId,
-                organization_id: continentalOrgId,
-                callback_date: nextWeek.toISOString().split('T')[0],
-                callback_time: '10:00:00',
-            },
-            // More prospects with different statuses
-            {
-                name: 'TLEAD-00009',
-                company_name: 'West Coast Transport',
-                industry: 'Transportation',
-                status: 'Interested',
-                lead_owner_id: janeId,
-                assigned_to_id: janeId,
-                primary_contact_name: 'Jennifer White',
-                primary_title: 'Operations Manager',
-                primary_phone: '555-9001',
-                primary_email: 'jennifer@westcoast.com',
-                city: 'San Francisco',
-                state: 'CA',
-                zip_code: '94101',
-                territory_id: californiaId,
-                organization_id: westCoastOrgId,
-                callback_date: null,
-            },
-            {
-                name: 'TLEAD-00010',
-                company_name: 'Mountain Freight',
-                industry: 'Freight',
-                status: 'Proposal',
-                lead_owner_id: shrutiId,
-                assigned_to_id: shrutiId,
-                primary_contact_name: 'Thomas Anderson',
-                primary_title: 'CEO',
-                primary_phone: '555-1001',
-                primary_email: 'thomas@mountainfreight.com',
-                city: 'Denver',
-                state: 'CO',
-                zip_code: '80201',
-                territory_id: coloradoId,
-                organization_id: mountainFreightOrgId,
-                callback_date: null,
-            },
-            {
-                name: 'TLEAD-00011',
-                company_name: 'Coastal Logistics',
-                industry: 'Logistics',
-                status: 'Won',
-                lead_owner_id: calvinId,
-                assigned_to_id: calvinId,
-                primary_contact_name: 'Maria Garcia',
-                primary_title: 'CFO',
-                primary_phone: '555-1101',
-                primary_email: 'maria@coastallogistics.com',
-                city: 'Miami',
-                state: 'FL',
-                zip_code: '33101',
-                territory_id: floridaId,
-                organization_id: coastalLogisticsOrgId,
-                callback_date: null,
-            },
-            {
-                name: 'TLEAD-00012',
-                company_name: 'Fast Track Delivery',
-                industry: 'Delivery',
-                status: 'Lost',
-                lead_owner_id: janeId,
-                assigned_to_id: janeId,
-                primary_contact_name: 'Robert Taylor',
-                primary_title: 'Operations Director',
-                primary_phone: '555-1201',
-                primary_email: 'robert@fasttrack.com',
-                city: 'Phoenix',
-                state: 'AZ',
-                zip_code: '85001',
-                territory_id: arizonaId,
-                organization_id: fastTrackOrgId,
-                callback_date: null,
-            },
+        console.log(`✅ Inserted ${usersData.length} users`);
+        // Get user IDs
+        const getUser = async (email) => {
+            const result = await database_1.pool.query('SELECT id FROM users WHERE email = $1', [email]);
+            return result.rows[0]?.id;
+        };
+        const corporateAdminId = await getUser('corporate.admin@tallac.io');
+        const businessCoachId = await getUser('business.coach@tallac.io');
+        const territoryAdminId = await getUser('territory.admin@tallac.io');
+        const territoryManagerId = await getUser('territory.manager@tallac.io');
+        const salesUserId = await getUser('sales.user@tallac.io');
+        const johnId = await getUser('john.doe@tallac.io');
+        const janeId = await getUser('jane.smith@tallac.io');
+        const mikeId = await getUser('mike.johnson@tallac.io');
+        const sarahId = await getUser('sarah.williams@tallac.io');
+        const davidId = await getUser('david.brown@tallac.io');
+        // Insert 8 territories with proper data matching Vue3 structure
+        const territoriesData = [
+            { name: 'Addison', code: '525TX', dba: 'Fastest Labs of Addison', region: 'South Central', state: 'Texas', status: 'Active' },
+            { name: 'Ann Arbor', code: '453MI', dba: 'Fastest Labs of Ann Arbor', region: 'Midwest', state: 'Michigan', status: 'Active' },
+            { name: 'Beaumont', code: '569TX', dba: 'Fastest Labs of Beaumont', region: 'South Central', state: 'Texas', status: 'Active' },
+            { name: 'Bethlehem', code: '510PA', dba: 'Fastest Labs of Bethlehem', region: 'Northeast', state: 'Pennsylvania', status: 'Active' },
+            { name: 'Alexandria', code: '224VA', dba: 'Fastest Labs of Alexandria', region: 'Southeast', state: 'Virginia', status: 'Active' },
+            { name: 'Asheville', code: '281NC', dba: 'Fastest Labs of Asheville', region: 'Southeast', state: 'North Carolina', status: 'Active' },
+            { name: 'Bellingham', code: '529WA', dba: 'Fastest Labs of Bellingham', region: 'Pacific Northwest', state: 'Washington', status: 'Active' },
+            { name: 'Bloomington', code: '150MN', dba: 'Fastest Labs of Bloomington', region: 'Midwest', state: 'Minnesota', status: 'Active' },
+            { name: 'Anaheim', code: '216CA', dba: 'Fastest Labs of Anaheim', region: 'Pacific Southwest', state: 'California', status: 'Active' },
+            { name: 'Azusa', code: '547CA', dba: 'Fastest Labs of Azusa', region: 'Pacific Southwest', state: 'California', status: 'Active' }
         ];
-        for (const lead of leadsData) {
+        const territoryIds = {};
+        for (const territory of territoriesData) {
+            const result = await database_1.pool.query(`
+        INSERT INTO tallac_territories (territory_name, territory_code, territory_dba, doing_business_as, territory_region, territory_state, territory_status, status)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      ON CONFLICT DO NOTHING
+        RETURNING id, territory_name
+      `, [territory.name, territory.code, territory.dba, territory.dba, territory.region, territory.state, territory.status, territory.status]);
+            if (result.rows.length > 0) {
+                territoryIds[territory.name] = result.rows[0].id;
+            }
+            else {
+                // Get existing territory ID
+                const existing = await database_1.pool.query('SELECT id FROM tallac_territories WHERE territory_name = $1', [territory.name]);
+                if (existing.rows.length > 0) {
+                    territoryIds[territory.name] = existing.rows[0].id;
+                    // Update existing territory
+                    await database_1.pool.query(`
+            UPDATE tallac_territories SET
+              territory_code = $1,
+              territory_dba = $2,
+              doing_business_as = $3,
+              territory_region = $4,
+              territory_state = $5,
+              territory_status = $6,
+              status = $7
+            WHERE id = $8
+          `, [territory.code, territory.dba, territory.dba, territory.region, territory.state, territory.status, territory.status, territoryIds[territory.name]]);
+                }
+            }
+        }
+        console.log(`✅ Inserted ${territoriesData.length} territories`);
+        // Add zip codes to territories (5-10 zipcodes per territory)
+        const zipCodesMap = {
+            'Addison': ['75001', '75002', '75003', '75004', '75005', '75006', '75007', '75008', '75009', '75010'],
+            'Ann Arbor': ['48103', '48104', '48105', '48106', '48107', '48108', '48109'],
+            'Beaumont': ['77701', '77702', '77703', '77704', '77705', '77706', '77707', '77708', '77709', '77710', '77711', '77712', '77713', '77714', '77715', '77716', '77717', '77718', '77719', '77720', '77721', '77722'],
+            'Bethlehem': ['18015', '18016', '18017', '18018'],
+            'Alexandria': ['22301', '22302', '22303', '22304', '22305', '22306', '22307', '22308', '22309', '22310', '22311', '22312'],
+            'Asheville': ['28801', '28802', '28803', '28804', '28805', '28806', '28807', '28808', '28809', '28810', '28811', '28812', '28813', '28814', '28815'],
+            'Bellingham': ['98225', '98226', '98227', '98228', '98229'],
+            'Bloomington': ['55420', '55421', '55422', '55423', '55424', '55425', '55426', '55427', '55428', '55429', '55430', '55431', '55432', '55433'],
+            'Anaheim': ['92801', '92802', '92803', '92804', '92805', '92806', '92807', '92808'],
+            'Azusa': ['91702', '91740', '91741', '91745', '91770', '91771', '91772', '91773', '91774', '91775', '91776']
+        };
+        for (const [territoryName, zipCodes] of Object.entries(zipCodesMap)) {
+            const territoryId = territoryIds[territoryName];
+            if (territoryId) {
+                for (const zipCode of zipCodes) {
+                    await database_1.pool.query(`
+            INSERT INTO territory_zip_codes (territory_id, zip_code, state)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (territory_id, zip_code) DO NOTHING
+          `, [territoryId, zipCode, territoriesData.find(t => t.name === territoryName)?.state || '']);
+                }
+            }
+        }
+        console.log('✅ Inserted zip codes for territories');
+        // Insert 8 partners
+        const partnersData = [
+            { code: 'PART-001', name: 'Northeast Partner', status: 'Active', city: 'Boston', state: 'MA', email: 'contact@northeastpartner.com', mobile: '555-1001', address: '123 Main St, Boston, MA 02101' },
+            { code: 'PART-002', name: 'Southeast Partner', status: 'Active', city: 'Atlanta', state: 'GA', email: 'contact@southeastpartner.com', mobile: '555-2001', address: '456 Oak Ave, Atlanta, GA 30301' },
+            { code: 'PART-003', name: 'Midwest Partner', status: 'Active', city: 'Chicago', state: 'IL', email: 'contact@midwestpartner.com', mobile: '555-3001', address: '789 Pine St, Chicago, IL 60601' },
+            { code: 'PART-004', name: 'Southwest Partner', status: 'Active', city: 'Dallas', state: 'TX', email: 'contact@southwestpartner.com', mobile: '555-4001', address: '321 Elm St, Dallas, TX 75201' },
+            { code: 'PART-005', name: 'West Coast Partner', status: 'Active', city: 'Los Angeles', state: 'CA', email: 'contact@westcoastpartner.com', mobile: '555-5001', address: '654 Maple Dr, Los Angeles, CA 90001' },
+            { code: 'PART-006', name: 'Pacific Partner', status: 'Active', city: 'Seattle', state: 'WA', email: 'contact@pacificpartner.com', mobile: '555-6001', address: '987 Cedar Ln, Seattle, WA 98101' },
+            { code: 'PART-007', name: 'Mountain Partner', status: 'Active', city: 'Denver', state: 'CO', email: 'contact@mountainpartner.com', mobile: '555-7001', address: '147 Birch Way, Denver, CO 80201' },
+            { code: 'PART-008', name: 'Central Partner', status: 'Active', city: 'Kansas City', state: 'MO', email: 'contact@centralpartner.com', mobile: '555-8001', address: '258 Spruce St, Kansas City, MO 64101' }
+        ];
+        const partnerIds = {};
+        for (const partner of partnersData) {
+            // First try to insert, if conflict on partner_code, update
+            let result;
+            try {
+                result = await database_1.pool.query(`INSERT INTO tallac_partners (name, partner_code, partner_name, partner_status, partner_city, partner_state, partner_email, partner_mobile, partner_address)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+           RETURNING id, name`, [partner.code, partner.code, partner.name, partner.status, partner.city, partner.state, partner.email, partner.mobile, partner.address]);
+            }
+            catch (e) {
+                // If conflict, update existing
+                if (e.code === '23505') { // Unique violation
+                    await database_1.pool.query(`
+            UPDATE tallac_partners SET
+              partner_name = $1,
+              partner_status = $2,
+              partner_city = $3,
+              partner_state = $4,
+              partner_email = $5,
+              partner_mobile = $6,
+              partner_address = $7
+            WHERE partner_code = $8
+          `, [partner.name, partner.status, partner.city, partner.state, partner.email, partner.mobile, partner.address, partner.code]);
+                    result = await database_1.pool.query('SELECT id, name FROM tallac_partners WHERE partner_code = $1', [partner.code]);
+                }
+                else {
+                    throw e;
+                }
+            }
+            if (result.rows.length > 0) {
+                partnerIds[partner.code] = result.rows[0].id;
+            }
+            else {
+                const existing = await database_1.pool.query('SELECT id, name FROM tallac_partners WHERE partner_code = $1', [partner.code]);
+                if (existing.rows.length > 0) {
+                    partnerIds[partner.code] = existing.rows[0].id;
+                }
+            }
+        }
+        console.log(`✅ Inserted ${partnersData.length} partners`);
+        // Link partners to territories (primary partner for each territory)
+        const partnerTerritoryMap = {
+            'Addison': 'PART-004',
+            'Ann Arbor': 'PART-003',
+            'Beaumont': 'PART-004',
+            'Bethlehem': 'PART-001',
+            'Alexandria': 'PART-002',
+            'Asheville': 'PART-002',
+            'Bellingham': 'PART-006',
+            'Bloomington': 'PART-003',
+            'Anaheim': 'PART-005',
+            'Azusa': 'PART-005'
+        };
+        for (const [territoryName, partnerCode] of Object.entries(partnerTerritoryMap)) {
+            const territoryId = territoryIds[territoryName];
+            const partnerId = partnerIds[partnerCode];
+            if (territoryId && partnerId) {
+                await database_1.pool.query(`
+          INSERT INTO partner_territories (partner_id, territory_id, is_primary)
+          VALUES ($1, $2, true)
+          ON CONFLICT (partner_id, territory_id) DO UPDATE SET is_primary = true
+        `, [partnerId, territoryId]);
+            }
+        }
+        console.log('✅ Linked partners to territories');
+        // Insert 10 prospects
+        const prospectsData = [
+            { name: 'TLEAD-00001', company: 'Northern Logistics', industry: 'Logistics', status: 'New', territory: 'Addison', owner: johnId, assigned: johnId, contact: 'John Smith', title: 'CEO', phone: '555-1001', email: 'john@northernlogistics.com', city: 'Addison', state: 'TX', zip: '75001' },
+            { name: 'TLEAD-00002', company: 'Summit Logistics', industry: 'Transportation', status: 'Contacted', territory: 'Ann Arbor', owner: janeId, assigned: janeId, contact: 'Jane Doe', title: 'Operations Director', phone: '555-2001', email: 'jane@summitlogistics.com', city: 'Ann Arbor', state: 'MI', zip: '48103' },
+            { name: 'TLEAD-00003', company: 'Pacific Transport', industry: 'Shipping', status: 'Interested', territory: 'Beaumont', owner: mikeId, assigned: mikeId, contact: 'Mike Johnson', title: 'VP Sales', phone: '555-3001', email: 'mike@pacifictransport.com', city: 'Beaumont', state: 'TX', zip: '77701' },
+            { name: 'TLEAD-00004', company: 'Coastal Carriers', industry: 'Freight', status: 'Proposal', territory: 'Bethlehem', owner: sarahId, assigned: sarahId, contact: 'Sarah Williams', title: 'CFO', phone: '555-4001', email: 'sarah@coastalcarriers.com', city: 'Bethlehem', state: 'PA', zip: '18015' },
+            { name: 'TLEAD-00005', company: 'Eagle Freight', industry: 'Logistics', status: 'Won', territory: 'Alexandria', owner: davidId, assigned: davidId, contact: 'David Brown', title: 'Director', phone: '555-5001', email: 'david@eaglefreight.com', city: 'Alexandria', state: 'VA', zip: '22301' },
+            { name: 'TLEAD-00006', company: 'Mountain Express', industry: 'Express', status: 'New', territory: 'Asheville', owner: salesUserId, assigned: salesUserId, contact: 'Robert Taylor', title: 'Manager', phone: '555-6001', email: 'robert@mountainexpress.com', city: 'Asheville', state: 'NC', zip: '28801' },
+            { name: 'TLEAD-00007', company: 'Harbor Shipping', industry: 'Maritime', status: 'Contacted', territory: 'Bellingham', owner: territoryManagerId, assigned: territoryManagerId, contact: 'Lisa Martinez', title: 'Operations Manager', phone: '555-7001', email: 'lisa@harborshipping.com', city: 'Bellingham', state: 'WA', zip: '98225' },
+            { name: 'TLEAD-00008', company: 'Continental Freight', industry: 'Freight Forwarding', status: 'Interested', territory: 'Bloomington', owner: territoryAdminId, assigned: territoryAdminId, contact: 'Thomas Anderson', title: 'VP Operations', phone: '555-8001', email: 'thomas@continentalfreight.com', city: 'Bloomington', state: 'MN', zip: '55420' },
+            { name: 'TLEAD-00009', company: 'West Coast Transport', industry: 'Transportation', status: 'Proposal', territory: 'Anaheim', owner: businessCoachId, assigned: businessCoachId, contact: 'Jennifer White', title: 'CEO', phone: '555-9001', email: 'jennifer@westcoast.com', city: 'Anaheim', state: 'CA', zip: '92801' },
+            { name: 'TLEAD-00010', company: 'Fast Track Delivery', industry: 'Delivery', status: 'Lost', territory: 'Azusa', owner: corporateAdminId, assigned: corporateAdminId, contact: 'Michael Chen', title: 'Director', phone: '555-0010', email: 'michael@fasttrack.com', city: 'Azusa', state: 'CA', zip: '91702' }
+        ];
+        for (const prospect of prospectsData) {
+            const territoryId = territoryIds[prospect.territory];
             await database_1.pool.query(`
         INSERT INTO tallac_leads (
           name, company_name, industry, status, lead_owner_id, assigned_to_id,
           primary_contact_name, primary_title, primary_phone, primary_email,
-          city, state, zip_code, territory_id, organization_id, callback_date, callback_time
+          city, state, zip_code, territory_id
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
         ON CONFLICT (name) DO UPDATE SET
           company_name = EXCLUDED.company_name,
           status = EXCLUDED.status,
-          callback_date = EXCLUDED.callback_date,
-          callback_time = EXCLUDED.callback_time
+          assigned_to_id = EXCLUDED.assigned_to_id
       `, [
-                lead.name,
-                lead.company_name,
-                lead.industry,
-                lead.status,
-                lead.lead_owner_id,
-                lead.assigned_to_id,
-                lead.primary_contact_name,
-                lead.primary_title,
-                lead.primary_phone,
-                lead.primary_email,
-                lead.city,
-                lead.state,
-                lead.zip_code,
-                lead.territory_id,
-                lead.organization_id,
-                lead.callback_date || null,
-                lead.callback_time || null,
+                prospect.name,
+                prospect.company,
+                prospect.industry,
+                prospect.status,
+                prospect.owner,
+                prospect.assigned,
+                prospect.contact,
+                prospect.title,
+                prospect.phone,
+                prospect.email,
+                prospect.city,
+                prospect.state,
+                prospect.zip,
+                territoryId
             ]);
         }
-        console.log(`✅ Inserted/Updated ${leadsData.length} leads`);
-        // Insert contact paths for leads
-        const leadIds = await database_1.pool.query("SELECT id, name FROM tallac_leads ORDER BY name");
-        for (let i = 0; i < Math.min(6, leadIds.rows.length); i++) {
-            const leadId = leadIds.rows[i].id;
-            await database_1.pool.query(`
-        INSERT INTO tallac_lead_contact_paths (lead_id, contact_name, status, sequence)
-        VALUES 
-          ($1, 'Head Office', 'Not Contacted', 1),
-          ($1, 'John Smith', 'Contacted', 2),
-          ($1, 'Mary Johnson', 'Interested', 3)
-        ON CONFLICT DO NOTHING
-      `, [leadId]);
-        }
-        console.log('✅ Inserted contact paths');
-        // Get activity status IDs
+        console.log(`✅ Inserted ${prospectsData.length} prospects`);
+        // Insert 10 activities
         const openStatus = await database_1.pool.query("SELECT id FROM activity_statuses WHERE status_name = 'Open'");
         const completedStatus = await database_1.pool.query("SELECT id FROM activity_statuses WHERE status_name = 'Completed'");
         const openStatusId = openStatus.rows[0]?.id;
         const completedStatusId = completedStatus.rows[0]?.id;
-        // Get lead and organization mappings for activities
-        const getLeadByName = async (name) => {
-            const result = await database_1.pool.query("SELECT id, company_name, organization_id FROM tallac_leads WHERE name = $1", [name]);
-            return result.rows[0];
-        };
-        // Insert comprehensive activities with all activity types
+        const today = new Date();
+        const tomorrow = new Date(today);
+        tomorrow.setDate(tomorrow.getDate() + 1);
         const activitiesData = [
-            // Call Log activities
-            {
-                name: 'TACT-00001',
-                activity_type: 'call-log',
-                title: 'Follow-up Call Required',
-                subject: 'Follow-up Call Required',
-                status_id: openStatusId,
-                priority: 'High',
-                scheduled_date: today.toISOString().split('T')[0],
-                scheduled_time: '14:00:00',
-                assigned_to_id: shrutiId,
-                created_by_id: calvinId,
-                description: 'Need to follow up on the proposal discussed last week. Client showed interest in expanding their fleet.',
-                reference_docname: 'TLEAD-00001',
-                company: 'Northern Logistics',
-            },
-            {
-                name: 'TACT-00002',
-                activity_type: 'call-log',
-                title: 'Call Log - Initial Contact',
-                subject: 'Initial Call',
-                status_id: completedStatusId,
-                priority: 'Medium',
-                scheduled_date: today.toISOString().split('T')[0],
-                scheduled_time: '10:00:00',
-                assigned_to_id: calvinId,
-                created_by_id: calvinId,
-                description: 'Made initial contact with procurement manager. Very receptive to our services.',
-                reference_docname: 'TLEAD-00007',
-                company: 'Harbor Shipping',
-            },
-            // Callback activities
-            {
-                name: 'TACT-00003',
-                activity_type: 'callback',
-                title: 'Schedule Callback Requested',
-                subject: 'Callback Request',
-                status_id: openStatusId,
-                priority: 'High',
-                scheduled_date: tomorrow.toISOString().split('T')[0],
-                scheduled_time: '14:00:00',
-                assigned_to_id: calvinId,
-                created_by_id: calvinId,
-                description: 'Client requested callback to discuss Q4 logistics partnership. Preferred time: 2-4 PM.',
-                reference_docname: 'TLEAD-00003',
-                company: 'Pacific Transport',
-            },
-            {
-                name: 'TACT-00004',
-                activity_type: 'callback',
-                title: 'Client Requested Callback',
-                subject: 'Callback Scheduled',
-                status_id: openStatusId,
-                priority: 'Medium',
-                scheduled_date: nextWeek.toISOString().split('T')[0],
-                scheduled_time: '15:00:00',
-                assigned_to_id: shrutiId,
-                created_by_id: shrutiId,
-                description: 'Client requested callback to discuss quarterly review and performance metrics.',
-                reference_docname: 'TLEAD-00001',
-                company: 'Northern Logistics',
-            },
-            // Appointment activities
-            {
-                name: 'TACT-00005',
-                activity_type: 'appointment',
-                title: 'Client Appointment Scheduled',
-                subject: 'Client Meeting',
-                status_id: openStatusId,
-                priority: 'High',
-                scheduled_date: tomorrow.toISOString().split('T')[0],
-                scheduled_time: '10:00:00',
-                assigned_to_id: shrutiId,
-                created_by_id: shrutiId,
-                description: 'Scheduled appointment with CEO to discuss partnership opportunities.',
-                reference_docname: 'TLEAD-00005',
-                company: 'Eagle Freight',
-            },
-            {
-                name: 'TACT-00006',
-                activity_type: 'appointment',
-                title: 'Product Demo Meeting',
-                subject: 'Product Demo',
-                status_id: openStatusId,
-                priority: 'Medium',
-                scheduled_date: nextWeek.toISOString().split('T')[0],
-                scheduled_time: '11:00:00',
-                assigned_to_id: johnId,
-                created_by_id: johnId,
-                description: 'Product demonstration meeting scheduled.',
-                reference_docname: 'TLEAD-00008',
-                company: 'Continental Freight',
-            },
-            // Note activities
-            {
-                name: 'TACT-00007',
-                activity_type: 'note',
-                title: 'Meeting Notes - Strategy Discussion',
-                subject: 'Strategy Meeting Notes',
-                status_id: openStatusId,
-                priority: 'Low',
-                scheduled_date: today.toISOString().split('T')[0],
-                scheduled_time: '09:00:00',
-                assigned_to_id: johnId,
-                created_by_id: johnId,
-                description: 'Detailed notes from the strategy meeting covering expansion plans and budget allocation.',
-                reference_docname: 'TLEAD-00004',
-                company: 'Coastal Carriers',
-            },
-            {
-                name: 'TACT-00008',
-                activity_type: 'note',
-                title: 'Client Feedback Notes',
-                subject: 'Feedback Session',
-                status_id: openStatusId,
-                priority: 'Low',
-                scheduled_date: today.toISOString().split('T')[0],
-                scheduled_time: '16:00:00',
-                assigned_to_id: calvinId,
-                created_by_id: calvinId,
-                description: 'Captured client feedback from the implementation review meeting.',
-                reference_docname: 'TLEAD-00002',
-                company: 'Summit Logistics',
-            },
-            // Changes activities
-            {
-                name: 'TACT-00009',
-                activity_type: 'changes',
-                title: 'Status Update - Contract Review',
-                subject: 'Contract Status',
-                status_id: completedStatusId,
-                priority: 'Medium',
-                scheduled_date: yesterday.toISOString().split('T')[0],
-                scheduled_time: '13:00:00',
-                assigned_to_id: shrutiId,
-                created_by_id: shrutiId,
-                description: 'Updated the contract status after legal review. Waiting for client signature.',
-                reference_docname: 'TLEAD-00002',
-                company: 'Summit Logistics',
-            },
-            {
-                name: 'TACT-00010',
-                activity_type: 'changes',
-                title: 'Contract Status Update',
-                subject: 'Contract Progress',
-                status_id: completedStatusId,
-                priority: 'Medium',
-                scheduled_date: nextWeek.toISOString().split('T')[0],
-                scheduled_time: '10:00:00',
-                assigned_to_id: johnId,
-                created_by_id: adminId,
-                description: 'Contract signed and countersigned. Moving to implementation phase.',
-                reference_docname: 'TLEAD-00008',
-                company: 'Continental Freight',
-            },
-            // Assignment activities
-            {
-                name: 'TACT-00011',
-                activity_type: 'assignment',
-                title: 'Prospect Assigned to Sales Team',
-                subject: 'New Assignment',
-                status_id: openStatusId,
-                priority: 'High',
-                scheduled_date: yesterday.toISOString().split('T')[0],
-                scheduled_time: '08:00:00',
-                assigned_to_id: calvinId,
-                created_by_id: adminId,
-                description: 'Assigned new prospect to sales team for follow-up. Priority level: High.',
-                reference_docname: 'TLEAD-00006',
-                company: 'Mountain Express',
-            },
-            {
-                name: 'TACT-00012',
-                activity_type: 'assignment',
-                title: 'Lead Reassigned',
-                subject: 'Reassignment',
-                status_id: openStatusId,
-                priority: 'Medium',
-                scheduled_date: today.toISOString().split('T')[0],
-                scheduled_time: '09:00:00',
-                assigned_to_id: shrutiId,
-                created_by_id: adminId,
-                description: 'Lead reassigned to different sales representative.',
-                reference_docname: 'TLEAD-00007',
-                company: 'Harbor Shipping',
-            },
+            { name: 'TACT-00001', type: 'call-log', title: 'Follow-up Call', status: openStatusId, priority: 'High', date: today.toISOString().split('T')[0], time: '14:00:00', assigned: johnId, created: johnId, description: 'Need to follow up on proposal', reference: 'TLEAD-00001', company: 'Northern Logistics' },
+            { name: 'TACT-00002', type: 'callback', title: 'Callback Scheduled', status: openStatusId, priority: 'Medium', date: tomorrow.toISOString().split('T')[0], time: '10:00:00', assigned: janeId, created: janeId, description: 'Client requested callback', reference: 'TLEAD-00002', company: 'Summit Logistics' },
+            { name: 'TACT-00003', type: 'appointment', title: 'Meeting Scheduled', status: openStatusId, priority: 'High', date: tomorrow.toISOString().split('T')[0], time: '15:00:00', assigned: mikeId, created: mikeId, description: 'Product demonstration meeting', reference: 'TLEAD-00003', company: 'Pacific Transport' },
+            { name: 'TACT-00004', type: 'note', title: 'Important Note', status: completedStatusId, priority: 'Low', date: today.toISOString().split('T')[0], time: '09:00:00', assigned: sarahId, created: sarahId, description: 'Client showed interest in premium package', reference: 'TLEAD-00004', company: 'Coastal Carriers' },
+            { name: 'TACT-00005', type: 'call-log', title: 'Initial Contact Call', status: completedStatusId, priority: 'Medium', date: today.toISOString().split('T')[0], time: '11:00:00', assigned: davidId, created: davidId, description: 'Made initial contact, very receptive', reference: 'TLEAD-00005', company: 'Eagle Freight' },
+            { name: 'TACT-00006', type: 'callback', title: 'Follow-up Callback', status: openStatusId, priority: 'High', date: tomorrow.toISOString().split('T')[0], time: '16:00:00', assigned: salesUserId, created: salesUserId, description: 'Need to discuss pricing', reference: 'TLEAD-00006', company: 'Mountain Express' },
+            { name: 'TACT-00007', type: 'appointment', title: 'Site Visit', status: openStatusId, priority: 'High', date: tomorrow.toISOString().split('T')[0], time: '13:00:00', assigned: territoryManagerId, created: territoryManagerId, description: 'On-site evaluation scheduled', reference: 'TLEAD-00007', company: 'Harbor Shipping' },
+            { name: 'TACT-00008', type: 'note', title: 'Status Update', status: completedStatusId, priority: 'Low', date: today.toISOString().split('T')[0], time: '10:30:00', assigned: territoryAdminId, created: territoryAdminId, description: 'Client reviewing proposal', reference: 'TLEAD-00008', company: 'Continental Freight' },
+            { name: 'TACT-00009', type: 'call-log', title: 'Proposal Discussion', status: openStatusId, priority: 'High', date: today.toISOString().split('T')[0], time: '15:30:00', assigned: businessCoachId, created: businessCoachId, description: 'Discussing proposal details', reference: 'TLEAD-00009', company: 'West Coast Transport' },
+            { name: 'TACT-00010', type: 'callback', title: 'Final Follow-up', status: openStatusId, priority: 'Medium', date: tomorrow.toISOString().split('T')[0], time: '14:30:00', assigned: corporateAdminId, created: corporateAdminId, description: 'Final follow-up call', reference: 'TLEAD-00010', company: 'Fast Track Delivery' }
         ];
         for (const activity of activitiesData) {
-            const lead = await getLeadByName(activity.reference_docname);
-            const orgId = lead?.organization_id || await getOrgId(activity.company);
+            // Get organization_id from prospect's company_name
+            const prospectResult = await database_1.pool.query('SELECT organization_id FROM tallac_leads WHERE name = $1', [activity.reference]);
+            const organizationId = prospectResult.rows[0]?.organization_id || null;
             await database_1.pool.query(`
         INSERT INTO tallac_activities (
           name, activity_type, title, status_id, priority,
@@ -645,159 +390,46 @@ async function seedDatabase() {
         )
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
         ON CONFLICT (name) DO UPDATE SET
-          activity_type = EXCLUDED.activity_type,
           title = EXCLUDED.title,
-          scheduled_date = EXCLUDED.scheduled_date,
-          organization_id = EXCLUDED.organization_id
+          status_id = EXCLUDED.status_id,
+          scheduled_date = EXCLUDED.scheduled_date
       `, [
                 activity.name,
-                activity.activity_type,
+                activity.type,
                 activity.title,
-                activity.status_id,
+                activity.status,
                 activity.priority,
-                activity.scheduled_date,
-                activity.scheduled_time,
-                activity.assigned_to_id,
-                activity.created_by_id,
+                activity.date,
+                activity.time,
+                activity.assigned,
+                activity.created,
                 activity.description,
                 'Tallac Lead',
-                activity.reference_docname,
-                orgId,
+                activity.reference,
+                organizationId
             ]);
         }
-        console.log(`✅ Inserted/Updated ${activitiesData.length} activities`);
-        // Insert call logs
-        const connectedStatus = await database_1.pool.query("SELECT id FROM call_statuses WHERE status_name = 'Connected'");
-        const connectedStatusId = connectedStatus.rows[0]?.id;
-        const callLogsData = [
-            {
-                name: 'TCALL-00001',
-                call_type: 'Outgoing',
-                call_status_id: connectedStatusId,
-                call_date: today.toISOString().split('T')[0],
-                call_time: '14:30:00',
-                call_outcome: 'Positive',
-                handled_by_id: calvinId,
-                caller_number: '555-1000',
-                receiver_number: '555-8001',
-                call_duration: 300,
-                call_summary: 'Discussed pricing and timeline. Customer interested in moving forward.',
-                reference_docname: 'TLEAD-00001',
-            },
-            {
-                name: 'TCALL-00002',
-                call_type: 'Incoming',
-                call_status_id: connectedStatusId,
-                call_date: yesterday.toISOString().split('T')[0],
-                call_time: '11:00:00',
-                call_outcome: 'Neutral',
-                handled_by_id: shrutiId,
-                caller_number: '555-8002',
-                receiver_number: '555-1001',
-                call_duration: 180,
-                call_summary: 'Customer requested callback to discuss proposal.',
-                reference_docname: 'TLEAD-00002',
-            },
-            {
-                name: 'TCALL-00003',
-                call_type: 'Outgoing',
-                call_status_id: connectedStatusId,
-                call_date: today.toISOString().split('T')[0],
-                call_time: '15:00:00',
-                call_outcome: 'Positive',
-                handled_by_id: calvinId,
-                caller_number: '555-1000',
-                receiver_number: '555-7001',
-                call_duration: 450,
-                call_summary: 'Initial contact call. Very positive response.',
-                reference_docname: 'TLEAD-00007',
-            },
-        ];
-        for (const callLog of callLogsData) {
-            await database_1.pool.query(`
-        INSERT INTO tallac_call_logs (
-          name, call_type, call_status_id, call_date, call_time,
-          call_outcome, handled_by_id, caller_number, receiver_number,
-          call_duration, call_summary, reference_doctype, reference_docname
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-        ON CONFLICT (name) DO NOTHING
-      `, [
-                callLog.name,
-                callLog.call_type,
-                callLog.call_status_id,
-                callLog.call_date,
-                callLog.call_time,
-                callLog.call_outcome,
-                callLog.handled_by_id,
-                callLog.caller_number,
-                callLog.receiver_number,
-                callLog.call_duration,
-                callLog.call_summary,
-                'Tallac Lead',
-                callLog.reference_docname,
-            ]);
-        }
-        console.log(`✅ Inserted ${callLogsData.length} call logs`);
-        // Insert notes
-        const notesData = [
-            {
-                title: 'Initial Research',
-                content: 'Initial research completed on company requirements and pain points.',
-                reference_docname: 'TLEAD-00001',
-                created_by_id: adminId,
-            },
-            {
-                title: 'Meeting Notes',
-                content: 'Meeting scheduled for next week to review proposal details.',
-                reference_docname: 'TLEAD-00002',
-                created_by_id: calvinId,
-            },
-            {
-                title: 'Follow-up Required',
-                content: 'Client needs follow-up call to discuss pricing options.',
-                reference_docname: 'TLEAD-00003',
-                created_by_id: shrutiId,
-            },
-        ];
-        for (const note of notesData) {
-            await database_1.pool.query(`
-        INSERT INTO tallac_notes (title, content, reference_doctype, reference_docname, created_by_id)
-        VALUES ($1, $2, $3, $4, $5)
-        ON CONFLICT DO NOTHING
-      `, [
-                note.title,
-                note.content,
-                'Tallac Lead',
-                note.reference_docname,
-                note.created_by_id,
-            ]);
-        }
-        console.log(`✅ Inserted ${notesData.length} notes`);
-        console.log('✅ Database seeding completed successfully!');
-        console.log(`📊 Summary:
-      - ${leadsData.length} Prospects (with queue statuses: overdue, today, scheduled)
-      - ${activitiesData.length} Activities (all types: call-log, callback, appointment, note, changes, assignment)
-      - ${callLogsData.length} Call Logs
-      - ${notesData.length} Notes
-      - All activities linked to prospects via company name`);
+        console.log(`✅ Inserted ${activitiesData.length} activities`);
+        console.log('\n📊 Summary:');
+        console.log(`   - ${usersData.length} Users (one for each role)`);
+        console.log(`   - ${territoriesData.length} Territories`);
+        console.log(`   - ${partnersData.length} Partners`);
+        console.log(`   - ${prospectsData.length} Prospects`);
+        console.log(`   - ${activitiesData.length} Activities`);
+        console.log('✅ Seeding complete');
     }
     catch (error) {
         console.error('❌ Error seeding database:', error);
         throw error;
     }
 }
-// Run if called directly
-if (require.main === module) {
-    seedDatabase()
-        .then(() => {
-        console.log('✅ Seeding complete');
-        process.exit(0);
-    })
-        .catch((error) => {
-        console.error('❌ Seeding failed:', error);
-        process.exit(1);
-    });
-}
-exports.default = seedDatabase;
+seedDatabase()
+    .then(() => {
+    console.log('✅ Database seeding completed successfully');
+    process.exit(0);
+})
+    .catch((error) => {
+    console.error('❌ Database seeding failed:', error);
+    process.exit(1);
+});
 //# sourceMappingURL=seed.js.map

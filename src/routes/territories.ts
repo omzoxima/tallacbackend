@@ -3,6 +3,7 @@ import { pool } from '../config/database';
 import { authenticateToken, requireRole, AuthRequest } from '../middleware/auth';
 
 const router = express.Router();
+const zipCodePattern = /^\d{5}$/;
 
 // Get all territories with owners and zip codes
 router.get('/', authenticateToken, async (req: AuthRequest, res) => {
@@ -29,7 +30,7 @@ router.get('/', authenticateToken, async (req: AuthRequest, res) => {
 
     const result = await pool.query(query, params);
 
-    // Fetch owners and zip codes for each territory
+    // Fetch owners, zip codes, partners, and counts for each territory
     const territories = await Promise.all(
       result.rows.map(async (territory) => {
         const ownersResult = await pool.query(
@@ -40,11 +41,41 @@ router.get('/', authenticateToken, async (req: AuthRequest, res) => {
           'SELECT * FROM territory_zip_codes WHERE territory_id = $1 ORDER BY zip_code',
           [territory.id]
         );
+        
+        // Get partners for this territory
+        const partnersResult = await pool.query(`
+          SELECT 
+            p.id,
+            p.name,
+            p.partner_name,
+            p.partner_code,
+            p.partner_address as address,
+            COALESCE(pt.is_primary, false) as is_primary
+          FROM partner_territories pt
+          JOIN tallac_partners p ON pt.partner_id = p.id
+          WHERE pt.territory_id = $1
+          ORDER BY COALESCE(pt.is_primary, false) DESC, p.partner_name
+        `, [territory.id]);
 
+        // Map territory fields to match frontend expectations
         return {
           ...territory,
+          name: territory.name || territory.id, // For compatibility
+          territory_dba: territory.territory_dba || territory.doing_business_as,
+          territory_status: territory.territory_status || territory.status || 'Active',
+          territory_code: territory.territory_code || '',
+          territory_region: territory.territory_region || '',
+          territory_state: territory.territory_state || '',
+          zipcode_count: zipCodesResult.rows.length,
           owners: ownersResult.rows,
-          zip_codes: zipCodesResult.rows
+          zip_codes: zipCodesResult.rows,
+          partners: partnersResult.rows.map(p => ({
+            name: p.name,
+            partner_name: p.partner_name,
+            partner_code: p.partner_code,
+            address: p.address,
+            is_primary: p.is_primary || false
+          }))
         };
       })
     );
@@ -106,7 +137,13 @@ router.post('/', authenticateToken, requireRole('Corporate Admin', 'Territory Ad
       email,
       map_address,
       owners,
-      zip_codes
+      zip_codes,
+      territory_code,
+      territory_region,
+      territory_state,
+      territory_status,
+      territory_email,
+      territory_mobile
     } = req.body;
 
     if (!territory_name) {
@@ -123,16 +160,54 @@ router.post('/', authenticateToken, requireRole('Corporate Admin', 'Territory Ad
       return res.status(400).json({ error: 'Territory name already exists. Select another name' });
     }
 
+    const normalizedZipCodes = Array.isArray(zip_codes)
+      ? zip_codes
+          .map((z: any) => ({
+            zip_code: (z.zip_code || '').trim(),
+            city: (z.city || '').trim(),
+            state: (z.state || territory_state || '').trim(),
+          }))
+          .filter((z: any) => z.zip_code)
+      : [];
+
+    if (normalizedZipCodes.length === 0) {
+      return res.status(400).json({ error: 'At least one ZIP code is required' });
+    }
+
+    for (const zip of normalizedZipCodes) {
+      if (!zipCodePattern.test(zip.zip_code)) {
+        return res.status(400).json({ error: `Invalid ZIP code: ${zip.zip_code}` });
+      }
+    }
+
     // Create territory
     const result = await pool.query(
       `INSERT INTO tallac_territories (
         territory_name, doing_business_as, status,
-        territory_owner, mobile, address, territory_manager_email, email, map_address
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        territory_owner, mobile, address, territory_manager_email, email, map_address,
+        territory_code, territory_region, territory_state, territory_status, territory_email, territory_mobile
+      ) VALUES (
+        $1, $2, $3,
+        $4, $5, $6, $7, $8, $9,
+        $10, $11, $12, $13, $14, $15
+      )
       RETURNING *`,
       [
-        territory_name, doing_business_as, status || 'Active',
-        territory_owner, mobile, address, territory_manager_email, email, map_address
+        territory_name,
+        doing_business_as,
+        status || 'Active',
+        territory_owner,
+        mobile,
+        address,
+        territory_manager_email,
+        email,
+        map_address,
+        territory_code || null,
+        territory_region || null,
+        territory_state || null,
+        territory_status || status || 'Active',
+        territory_email || null,
+        territory_mobile || null
       ]
     );
 
@@ -151,15 +226,13 @@ router.post('/', authenticateToken, requireRole('Corporate Admin', 'Territory Ad
     }
 
     // Add zip codes if provided
-    if (zip_codes && Array.isArray(zip_codes)) {
-      for (const zipCode of zip_codes) {
-        if (zipCode.zip_code) {
-          await pool.query(
-            'INSERT INTO territory_zip_codes (territory_id, zip_code, city, state) VALUES ($1, $2, $3, $4)',
-            [territory.id, zipCode.zip_code, zipCode.city || null, zipCode.state || null]
-          );
-        }
-      }
+    for (const zipCode of normalizedZipCodes) {
+      await pool.query(
+        `INSERT INTO territory_zip_codes (territory_id, zip_code, city, state)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (territory_id, zip_code) DO NOTHING`,
+        [territory.id, zipCode.zip_code, zipCode.city || null, zipCode.state || null]
+      );
     }
 
     // Fetch the complete territory with owners and zip codes
@@ -201,7 +274,13 @@ router.put('/:id', authenticateToken, requireRole('Corporate Admin', 'Territory 
       email,
       map_address,
       owners,
-      zip_codes
+      zip_codes,
+      territory_code,
+      territory_region,
+      territory_state,
+      territory_status,
+      territory_email,
+      territory_mobile
     } = req.body;
 
     // Check if territory exists
@@ -233,12 +312,20 @@ router.put('/:id', authenticateToken, requireRole('Corporate Admin', 'Territory 
         territory_manager_email = COALESCE($7, territory_manager_email),
         email = COALESCE($8, email),
         map_address = COALESCE($9, map_address),
+        territory_code = COALESCE($10, territory_code),
+        territory_region = COALESCE($11, territory_region),
+        territory_state = COALESCE($12, territory_state),
+        territory_status = COALESCE($13, territory_status),
+        territory_email = COALESCE($14, territory_email),
+        territory_mobile = COALESCE($15, territory_mobile),
         updated_at = CURRENT_TIMESTAMP
-      WHERE id = $10
+      WHERE id = $16
       RETURNING *`,
       [
         territory_name, doing_business_as, status,
-        territory_owner, mobile, address, territory_manager_email, email, map_address, id
+        territory_owner, mobile, address, territory_manager_email, email, map_address,
+        territory_code, territory_region, territory_state, territory_status || status,
+        territory_email, territory_mobile, id
       ]
     );
 
@@ -261,18 +348,32 @@ router.put('/:id', authenticateToken, requireRole('Corporate Admin', 'Territory 
 
     // Update zip codes if provided
     if (zip_codes !== undefined) {
+      const normalizedZipCodes = Array.isArray(zip_codes)
+        ? zip_codes
+            .map((z: any) => ({
+              zip_code: (z.zip_code || '').trim(),
+              city: (z.city || '').trim(),
+              state: (z.state || territory_state || '').trim(),
+            }))
+            .filter((z: any) => z.zip_code)
+        : [];
+
+      for (const zip of normalizedZipCodes) {
+        if (!zipCodePattern.test(zip.zip_code)) {
+          return res.status(400).json({ error: `Invalid ZIP code: ${zip.zip_code}` });
+        }
+      }
+
       // Delete existing zip codes
       await pool.query('DELETE FROM territory_zip_codes WHERE territory_id = $1', [id]);
       // Add new zip codes
-      if (Array.isArray(zip_codes)) {
-        for (const zipCode of zip_codes) {
-          if (zipCode.zip_code) {
-            await pool.query(
-              'INSERT INTO territory_zip_codes (territory_id, zip_code, city, state) VALUES ($1, $2, $3, $4)',
-              [id, zipCode.zip_code, zipCode.city || null, zipCode.state || null]
-            );
-          }
-        }
+      for (const zipCode of normalizedZipCodes) {
+        await pool.query(
+          `INSERT INTO territory_zip_codes (territory_id, zip_code, city, state)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (territory_id, zip_code) DO NOTHING`,
+          [id, zipCode.zip_code, zipCode.city || null, zipCode.state || null]
+        );
       }
     }
 

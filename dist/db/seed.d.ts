@@ -1,3 +1,2 @@
-declare function seedDatabase(): Promise<void>;
-export default seedDatabase;
+export {};
 //# sourceMappingURL=seed.d.ts.map

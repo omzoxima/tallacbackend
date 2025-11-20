@@ -18,6 +18,7 @@ const territories_1 = __importDefault(require("./routes/territories"));
 const companies_1 = __importDefault(require("./routes/companies"));
 const users_1 = __importDefault(require("./routes/users"));
 const knowledgeBase_1 = __importDefault(require("./routes/knowledgeBase"));
+const partners_1 = __importDefault(require("./routes/partners"));
 dotenv_1.default.config();
 const app = (0, express_1.default)();
 const PORT = process.env.PORT || 3001;
@@ -58,6 +59,7 @@ app.use('/api/territories', territories_1.default);
 app.use('/api/companies', companies_1.default);
 app.use('/api/users', users_1.default);
 app.use('/api/knowledge-base', knowledgeBase_1.default);
+app.use('/api/partners', partners_1.default);
 // Error handling middleware
 app.use((err, req, res, next) => {
     console.error('Error:', err);
