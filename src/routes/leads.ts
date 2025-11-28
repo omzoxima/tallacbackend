@@ -155,19 +155,38 @@ router.get('/', async (req, res) => {
 
     const result = await pool.query(query, params);
 
-    // Get contact paths for each lead
-    for (const lead of result.rows) {
+    // Get contact paths for all leads in a single query (performance optimization)
+    if (result.rows.length > 0) {
+      const leadIds = result.rows.map((lead) => lead.id);
       const contactPathQuery = `
         SELECT 
-          cp.contact_name,
+          cp.lead_id,
+          cp.contact_name as name,
           cp.status,
           cp.sequence
         FROM tallac_lead_contact_paths cp
-        WHERE cp.lead_id = $1
-        ORDER BY cp.sequence ASC
+        WHERE cp.lead_id = ANY($1)
+        ORDER BY cp.lead_id, cp.sequence ASC
       `;
-      const contactPathResult = await pool.query(contactPathQuery, [lead.id]);
-      lead.contact_path = contactPathResult.rows;
+      const contactPathResult = await pool.query(contactPathQuery, [leadIds]);
+      
+      // Group contact paths by lead_id
+      const contactPathsByLeadId: Record<number, any[]> = {};
+      contactPathResult.rows.forEach((cp) => {
+        if (!contactPathsByLeadId[cp.lead_id]) {
+          contactPathsByLeadId[cp.lead_id] = [];
+        }
+        contactPathsByLeadId[cp.lead_id].push({
+          name: cp.name,
+          status: cp.status,
+          sequence: cp.sequence
+        });
+      });
+      
+      // Attach contact paths to leads
+      result.rows.forEach((lead) => {
+        lead.contact_path = contactPathsByLeadId[lead.id] || [];
+      });
     }
 
     res.json(result.rows);
@@ -233,6 +252,63 @@ router.post('/', async (req, res) => {
   try {
     const leadData = req.body;
     
+    // Validate zip code is provided (mandatory)
+    if (!leadData.zip_code || !leadData.zip_code.trim()) {
+      return res.status(400).json({ error: 'ZIP code is required' });
+    }
+    
+    // Find territory from zip code
+    let territoryId = leadData.territory_id || null;
+    let territoryOwnerId = null;
+    
+    if (leadData.zip_code) {
+      const territoryQuery = `
+        SELECT tz.territory_id, t.territory_name
+        FROM territory_zip_codes tz
+        JOIN tallac_territories t ON tz.territory_id = t.id
+        WHERE tz.zip_code = $1
+        LIMIT 1
+      `;
+      const territoryResult = await pool.query(territoryQuery, [leadData.zip_code.trim()]);
+      
+      if (territoryResult.rows.length > 0) {
+        territoryId = territoryResult.rows[0].territory_id;
+        
+        // Find territory owner (excluding Sales User and Tallac User roles)
+        const ownerQuery = `
+          SELECT u.id, u.full_name, u.role, u.tallac_role
+          FROM territory_owners to_owners
+          JOIN users u ON to_owners.owner_name = u.full_name
+          WHERE to_owners.territory_id = $1
+          AND u.role NOT IN ('Sales User', 'Tallac User')
+          AND (u.tallac_role IS NULL OR u.tallac_role NOT IN ('Sales User', 'Tallac User'))
+          AND u.is_active = true
+          LIMIT 1
+        `;
+        const ownerResult = await pool.query(ownerQuery, [territoryId]);
+        
+        // If no owner found in territory_owners, try to find from tallac_territories.territory_owner
+        if (ownerResult.rows.length === 0) {
+          const fallbackOwnerQuery = `
+            SELECT u.id, u.full_name, u.role, u.tallac_role
+            FROM tallac_territories t
+            JOIN users u ON t.territory_owner = u.full_name
+            WHERE t.id = $1
+            AND u.role NOT IN ('Sales User', 'Tallac User')
+            AND (u.tallac_role IS NULL OR u.tallac_role NOT IN ('Sales User', 'Tallac User'))
+            AND u.is_active = true
+            LIMIT 1
+          `;
+          const fallbackResult = await pool.query(fallbackOwnerQuery, [territoryId]);
+          if (fallbackResult.rows.length > 0) {
+            territoryOwnerId = fallbackResult.rows[0].id;
+          }
+        } else {
+          territoryOwnerId = ownerResult.rows[0].id;
+        }
+      }
+    }
+    
     // Generate name (TLEAD-00001 format)
     const nameQuery = await pool.query(
       'SELECT COUNT(*) as count FROM tallac_leads'
@@ -243,11 +319,20 @@ router.post('/', async (req, res) => {
     const insertQuery = `
       INSERT INTO tallac_leads (
         name, company_name, industry, status, organization_id,
-        territory_id, primary_contact_name, primary_title,
-        primary_phone, primary_email, city, state, zip_code
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        territory_id, lead_owner_id, primary_contact_name, primary_title,
+        primary_phone, primary_email, city, state, zip_code, full_address
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
       RETURNING *
     `;
+    
+    // Build full address
+    const addressParts = [
+      leadData.address,
+      leadData.city,
+      leadData.state,
+      leadData.zip_code
+    ].filter(Boolean);
+    const fullAddress = addressParts.join(', ');
     
     const result = await pool.query(insertQuery, [
       name,
@@ -255,7 +340,8 @@ router.post('/', async (req, res) => {
       leadData.industry || null,
       leadData.status || 'New',
       leadData.organization_id || null,
-      leadData.territory_id || null,
+      territoryId,
+      territoryOwnerId, // Auto-assigned based on territory
       leadData.primary_contact_name || null,
       leadData.primary_title || null,
       leadData.primary_phone || null,
@@ -263,6 +349,7 @@ router.post('/', async (req, res) => {
       leadData.city || null,
       leadData.state || null,
       leadData.zip_code || null,
+      fullAddress || null,
     ]);
     
     res.status(201).json(result.rows[0]);
