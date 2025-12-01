@@ -8,8 +8,8 @@ const bcryptjs_1 = __importDefault(require("bcryptjs"));
 const database_1 = require("../config/database");
 const auth_1 = require("../middleware/auth");
 const router = express_1.default.Router();
-// Get all users (Team management)
-router.get('/', auth_1.authenticateToken, (0, auth_1.requireRole)('Corporate Admin', 'Territory Admin', 'Territory Manager'), async (req, res) => {
+// Get all users (Team management) - Allow all authenticated users to see active users for assignment
+router.get('/', auth_1.authenticateToken, async (req, res) => {
     try {
         const { search, role, status, limit = 1000, offset = 0 } = req.query;
         let query = `

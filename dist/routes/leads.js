@@ -182,6 +182,13 @@ router.get('/', async (req, res) => {
                 params.push(owner);
             }
         }
+        // Assigned to filter (for user-specific filtering)
+        const assigned_to = req.query.assigned_to;
+        if (assigned_to) {
+            paramCount++;
+            query += ` AND l.assigned_to_id = $${paramCount}::uuid`;
+            params.push(assigned_to);
+        }
         // Search filter
         if (search_text) {
             paramCount++;
@@ -526,8 +533,20 @@ router.put('/:id', async (req, res) => {
         Object.keys(leadData).forEach((key) => {
             if (key !== 'id' && key !== 'name' && key !== 'created_at') {
                 paramCount++;
-                updateFields.push(`${key} = $${paramCount}`);
-                values.push(leadData[key]);
+                // Handle UUID fields properly
+                if (key === 'assigned_to_id' || key === 'lead_owner_id' || key === 'territory_id' || key === 'organization_id' || key === 'primary_contact_id') {
+                    if (leadData[key] === null || leadData[key] === '') {
+                        updateFields.push(`${key} = NULL`);
+                    }
+                    else {
+                        updateFields.push(`${key} = $${paramCount}::uuid`);
+                        values.push(leadData[key]);
+                    }
+                }
+                else {
+                    updateFields.push(`${key} = $${paramCount}`);
+                    values.push(leadData[key]);
+                }
             }
         });
         if (updateFields.length === 0) {
@@ -553,83 +572,63 @@ router.put('/:id', async (req, res) => {
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-// Assign lead
-router.post('/:id/assign', async (req, res) => {
-    try {
-        const { id } = req.params;
-        const { user_id } = req.body;
-        const query = `
-      UPDATE tallac_leads
-      SET assigned_to_id = $1, assigned_date = CURRENT_DATE, updated_at = CURRENT_TIMESTAMP
-      WHERE id = $2 OR name = $2
-      RETURNING *
-    `;
-        const result = await database_1.pool.query(query, [user_id, id]);
-        if (result.rows.length === 0) {
-            return res.status(404).json({ error: 'Lead not found' });
-        }
-        res.json({ success: true, message: 'Lead assigned successfully', lead: result.rows[0] });
-    }
-    catch (error) {
-        console.error('Error assigning lead:', error);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
-// Delete lead
-router.delete('/:id', async (req, res) => {
-    try {
-        const { id } = req.params;
-        const query = 'DELETE FROM tallac_leads WHERE id = $1 OR name = $1 RETURNING *';
-        const result = await database_1.pool.query(query, [id]);
-        if (result.rows.length === 0) {
-            return res.status(404).json({ error: 'Lead not found' });
-        }
-        res.json({ success: true, message: 'Lead deleted successfully' });
-    }
-    catch (error) {
-        console.error('Error deleting lead:', error);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
-// Bulk assign leads
+// Bulk assign leads - MUST be before /:id/assign to avoid route conflict
 router.post('/bulk/assign', async (req, res) => {
     try {
-        const { lead_names, user_id } = req.body;
-        if (!Array.isArray(lead_names) || lead_names.length === 0) {
-            return res.status(400).json({ error: 'lead_names array is required' });
+        const { lead_ids, user_id } = req.body;
+        console.log('📥 Bulk assign request received:', { lead_ids, user_id });
+        if (!lead_ids || !Array.isArray(lead_ids) || lead_ids.length === 0) {
+            return res.status(400).json({ error: 'lead_ids array is required' });
         }
-        // Get user ID if user_id is an email
-        let assignedToId = user_id;
-        if (typeof user_id === 'string' && user_id.includes('@')) {
-            const userQuery = await database_1.pool.query('SELECT id FROM users WHERE email = $1', [user_id]);
-            if (userQuery.rows.length > 0) {
-                assignedToId = userQuery.rows[0].id;
-            }
-            else {
-                return res.status(404).json({ error: 'User not found' });
-            }
+        if (!user_id) {
+            return res.status(400).json({ error: 'user_id is required' });
         }
-        // Update all leads
-        const placeholders = lead_names.map((_, i) => `$${i + 2}`).join(', ');
+        // Simple direct update - search in tallac_leads table by UUID
+        // Update all leads where id matches any of the provided UUIDs
         const query = `
       UPDATE tallac_leads
-      SET assigned_to_id = $1, assigned_date = CURRENT_DATE, updated_at = CURRENT_TIMESTAMP
-      WHERE name = ANY(ARRAY[${placeholders}])
-      RETURNING name, company_name
+      SET assigned_to_id = $1::uuid, 
+          assigned_date = CURRENT_DATE, 
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = ANY($2::uuid[])
+      RETURNING id, name, company_name
     `;
-        const result = await database_1.pool.query(query, [assignedToId, ...lead_names]);
+        const result = await database_1.pool.query(query, [user_id, lead_ids]);
+        console.log(`✅ Updated ${result.rows.length} out of ${lead_ids.length} leads`);
+        if (result.rows.length === 0) {
+            // Check if any leads exist with these IDs
+            const checkQuery = `SELECT id, name FROM tallac_leads WHERE id = ANY($1::uuid[]) LIMIT 1`;
+            const checkResult = await database_1.pool.query(checkQuery, [lead_ids]);
+            if (checkResult.rows.length === 0) {
+                return res.status(404).json({
+                    error: 'No leads found with the provided IDs',
+                    provided_ids: lead_ids,
+                    table: 'tallac_leads'
+                });
+            }
+        }
         res.json({
             success: true,
-            message: `Assigned ${result.rows.length} leads successfully`,
-            count: result.rows.length
+            message: `Assigned ${result.rows.length} lead(s) successfully`,
+            count: result.rows.length,
+            assigned_leads: result.rows
         });
     }
     catch (error) {
-        console.error('Error bulk assigning leads:', error);
-        res.status(500).json({ error: 'Internal server error' });
+        console.error('❌ Error bulk assigning leads:', error);
+        console.error('Error details:', {
+            message: error.message,
+            code: error.code,
+            detail: error.detail,
+            stack: error.stack
+        });
+        res.status(500).json({
+            error: 'Internal server error',
+            details: process.env.NODE_ENV === 'development' ? error.message : undefined
+        });
     }
 });
-// Bulk update status
+// Bulk update status - MUST be before /:id routes
 router.post('/bulk/status', async (req, res) => {
     try {
         const { lead_names, status } = req.body;
@@ -669,7 +668,7 @@ router.post('/bulk/status', async (req, res) => {
         res.status(500).json({ error: 'Internal server error' });
     }
 });
-// Bulk delete leads
+// Bulk delete leads - MUST be before /:id routes
 router.post('/bulk/delete', async (req, res) => {
     try {
         const { lead_names } = req.body;
@@ -692,6 +691,65 @@ router.post('/bulk/delete', async (req, res) => {
     }
     catch (error) {
         console.error('Error bulk deleting leads:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+// Assign lead
+router.post('/:id/assign', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { user_id } = req.body;
+        console.log('📥 Single assign request:', { lead_id: id, user_id });
+        // Simple direct update - search in tallac_leads table by UUID
+        const query = `
+      UPDATE tallac_leads
+      SET assigned_to_id = $1::uuid, 
+          assigned_date = CURRENT_DATE, 
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = $2::uuid
+      RETURNING id, name, company_name
+    `;
+        const result = await database_1.pool.query(query, [user_id || null, id]);
+        if (result.rows.length === 0) {
+            // Check if lead exists
+            const checkQuery = `SELECT id, name FROM tallac_leads WHERE id = $1::uuid`;
+            const checkResult = await database_1.pool.query(checkQuery, [id]);
+            if (checkResult.rows.length === 0) {
+                return res.status(404).json({
+                    error: 'Lead not found',
+                    provided_id: id,
+                    table: 'tallac_leads'
+                });
+            }
+        }
+        console.log(`✅ Lead assigned: ${result.rows[0]?.name}`);
+        res.json({
+            success: true,
+            message: 'Lead assigned successfully',
+            lead: result.rows[0]
+        });
+    }
+    catch (error) {
+        console.error('❌ Error assigning lead:', error);
+        res.status(500).json({
+            error: 'Internal server error',
+            details: process.env.NODE_ENV === 'development' ? error.message : undefined
+        });
+    }
+});
+// Delete lead
+router.delete('/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const query = 'DELETE FROM tallac_leads WHERE id = $1 OR name = $1 RETURNING *';
+        const result = await database_1.pool.query(query, [id]);
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Lead not found' });
+        }
+        res.json({ success: true, message: 'Lead deleted successfully' });
+    }
+    catch (error) {
+        console.error('Error deleting lead:', error);
         res.status(500).json({ error: 'Internal server error' });
     }
 });

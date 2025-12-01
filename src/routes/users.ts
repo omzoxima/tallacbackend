@@ -5,8 +5,8 @@ import { authenticateToken, requireRole, AuthRequest } from '../middleware/auth'
 
 const router = express.Router();
 
-// Get all users (Team management)
-router.get('/', authenticateToken, requireRole('Corporate Admin', 'Territory Admin', 'Territory Manager'), async (req: AuthRequest, res) => {
+// Get all users (Team management) - Allow all authenticated users to see active users for assignment
+router.get('/', authenticateToken, async (req: AuthRequest, res) => {
   try {
     const { search, role, status, limit = 1000, offset = 0 } = req.query;
 
