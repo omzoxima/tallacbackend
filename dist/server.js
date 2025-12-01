@@ -16,9 +16,11 @@ const dashboard_1 = __importDefault(require("./routes/dashboard"));
 const auth_1 = __importDefault(require("./routes/auth"));
 const territories_1 = __importDefault(require("./routes/territories"));
 const companies_1 = __importDefault(require("./routes/companies"));
+const contacts_1 = __importDefault(require("./routes/contacts"));
 const users_1 = __importDefault(require("./routes/users"));
 const knowledgeBase_1 = __importDefault(require("./routes/knowledgeBase"));
 const partners_1 = __importDefault(require("./routes/partners"));
+const callLogs_1 = __importDefault(require("./routes/callLogs"));
 dotenv_1.default.config();
 const app = (0, express_1.default)();
 const PORT = process.env.PORT || 3001;
@@ -57,9 +59,11 @@ app.use('/api/activities', activities_1.default);
 app.use('/api/dashboard', dashboard_1.default);
 app.use('/api/territories', territories_1.default);
 app.use('/api/companies', companies_1.default);
+app.use('/api/contacts', contacts_1.default);
 app.use('/api/users', users_1.default);
 app.use('/api/knowledge-base', knowledgeBase_1.default);
 app.use('/api/partners', partners_1.default);
+app.use('/api/call-logs', callLogs_1.default);
 // Error handling middleware
 app.use((err, req, res, next) => {
     console.error('Error:', err);

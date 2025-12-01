@@ -12,9 +12,11 @@ import dashboardRoutes from './routes/dashboard';
 import authRoutes from './routes/auth';
 import territoriesRoutes from './routes/territories';
 import companiesRoutes from './routes/companies';
+import contactsRoutes from './routes/contacts';
 import usersRoutes from './routes/users';
 import knowledgeBaseRoutes from './routes/knowledgeBase';
 import partnersRoutes from './routes/partners';
+import callLogsRoutes from './routes/callLogs';
 
 dotenv.config();
 
@@ -57,9 +59,11 @@ app.use('/api/activities', activitiesRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/territories', territoriesRoutes);
 app.use('/api/companies', companiesRoutes);
+app.use('/api/contacts', contactsRoutes);
 app.use('/api/users', usersRoutes);
 app.use('/api/knowledge-base', knowledgeBaseRoutes);
 app.use('/api/partners', partnersRoutes);
+app.use('/api/call-logs', callLogsRoutes);
 
 // Error handling middleware
 app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {

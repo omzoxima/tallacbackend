@@ -14,9 +14,12 @@ const poolConfig = {
     user: process.env.DB_USER,
     password: process.env.DB_PASS,
     database: process.env.DB_NAME,
-    max: 20,
-    idleTimeoutMillis: 60000, // 60 seconds - keep connections alive longer
-    connectionTimeoutMillis: 30000, // 30 seconds - increased for remote database (AWS App Runner)
+    max: 30, // Increased for better concurrency
+    min: 5, // Keep minimum connections alive
+    idleTimeoutMillis: 30000, // 30 seconds - reduced for better connection reuse
+    connectionTimeoutMillis: 10000, // 10 seconds - faster timeout for better error handling
+    statement_timeout: 30000, // 30 seconds - prevent long-running queries
+    query_timeout: 30000, // 30 seconds - prevent hanging queries
     // SSL configuration for AWS RDS (required for RDS)
     ssl: process.env.DB_SSL === 'true' ? {
         rejectUnauthorized: false, // Set to true in production with proper certificates

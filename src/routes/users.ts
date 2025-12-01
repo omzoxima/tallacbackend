@@ -55,55 +55,77 @@ router.get('/', authenticateToken, requireRole('Corporate Admin', 'Territory Adm
 
     const result = await pool.query(query, params);
     
-    // For each user, fetch territories and telephony lines
-    const usersWithDetails = await Promise.all(result.rows.map(async (user) => {
-      // Get territories
-      const territoriesResult = await pool.query(`
+    // Performance optimization: Fetch all territories and telephony in parallel queries instead of N+1
+    const userIds = result.rows.map(u => u.id);
+    
+    const [territoriesResult, telephonyResult] = await Promise.all([
+      // Get all territories for all users in one query
+      userIds.length > 0 ? pool.query(`
         SELECT 
+          uta.user_id,
           t.id, t.territory_name, t.territory_code, t.territory_status,
           t.territory_state, t.territory_region,
           COUNT(DISTINCT tzc.zip_code) as zipcode_count
         FROM user_territory_assignments uta
         JOIN tallac_territories t ON uta.territory_id = t.id
         LEFT JOIN territory_zip_codes tzc ON t.id = tzc.territory_id
-        WHERE uta.user_id = $1
-        GROUP BY t.id, t.territory_name, t.territory_code, t.territory_status, t.territory_state, t.territory_region
-      `, [user.id]);
+        WHERE uta.user_id = ANY($1)
+        GROUP BY uta.user_id, t.id, t.territory_name, t.territory_code, t.territory_status, t.territory_state, t.territory_region
+      `, [userIds]) : Promise.resolve({ rows: [] }),
       
-      // Get telephony lines
-      const telephonyResult = await pool.query(`
+      // Get all telephony lines for all users in one query
+      userIds.length > 0 ? pool.query(`
         SELECT 
+          utel.user_id,
           tl.id, tl.line_name, tl.phone_number as line_number, tl.provider as carrier,
           tl.is_active as line_status, 'VoIP' as line_type
         FROM user_telephony_assignments utel
         JOIN telephony_lines tl ON utel.telephony_line_id = tl.id
-        WHERE utel.user_id = $1
-      `, [user.id]);
-      
-      return {
-        ...user,
-        name: user.email, // Use email as name for compatibility
-        status: user.is_active ? 'Active' : 'Inactive', // Add status field for Vue3 compatibility
-        territories: territoriesResult.rows.map(t => ({
-          territory: t.id, // Use UUID as territory identifier
-          territory_name: t.territory_name,
-          territory_code: t.territory_code,
-          territory_status: t.territory_status,
-          territory_state: t.territory_state,
-          territory_region: t.territory_region,
-          zipcode_count: parseInt(t.zipcode_count) || 0
-        })),
-        telephony_lines: telephonyResult.rows.map(tl => ({
-          line_number: tl.line_number,
-          line_status: tl.line_status ? 'Active' : 'Inactive',
-          line_type: tl.line_type,
-          carrier: tl.carrier
-        })),
-        territory_count: parseInt(user.territory_count) || 0,
-        telephony_count: parseInt(user.telephony_count) || 0,
-        prospect_count: parseInt(user.prospect_count) || 0,
-        activity_count: parseInt(user.activity_count) || 0
-      };
+        WHERE utel.user_id = ANY($1)
+      `, [userIds]) : Promise.resolve({ rows: [] })
+    ]);
+    
+    // Group territories and telephony by user_id
+    const territoriesByUserId: Record<number, any[]> = {};
+    territoriesResult.rows.forEach((t: any) => {
+      if (!territoriesByUserId[t.user_id]) {
+        territoriesByUserId[t.user_id] = [];
+      }
+      territoriesByUserId[t.user_id].push({
+        territory: t.id,
+        territory_name: t.territory_name,
+        territory_code: t.territory_code,
+        territory_status: t.territory_status,
+        territory_state: t.territory_state,
+        territory_region: t.territory_region,
+        zipcode_count: parseInt(t.zipcode_count) || 0
+      });
+    });
+    
+    const telephonyByUserId: Record<number, any[]> = {};
+    telephonyResult.rows.forEach((tl: any) => {
+      if (!telephonyByUserId[tl.user_id]) {
+        telephonyByUserId[tl.user_id] = [];
+      }
+      telephonyByUserId[tl.user_id].push({
+        line_number: tl.line_number,
+        line_status: tl.line_status ? 'Active' : 'Inactive',
+        line_type: tl.line_type,
+        carrier: tl.carrier
+      });
+    });
+    
+    // Map users with their territories and telephony
+    const usersWithDetails = result.rows.map((user) => ({
+      ...user,
+      name: user.email, // Use email as name for compatibility
+      status: user.is_active ? 'Active' : 'Inactive', // Add status field for Vue3 compatibility
+      territories: territoriesByUserId[user.id] || [],
+      telephony_lines: telephonyByUserId[user.id] || [],
+      territory_count: parseInt(user.territory_count) || 0,
+      telephony_count: parseInt(user.telephony_count) || 0,
+      prospect_count: parseInt(user.prospect_count) || 0,
+      activity_count: parseInt(user.activity_count) || 0
     }));
     
     res.json(usersWithDetails);

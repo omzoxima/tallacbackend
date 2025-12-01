@@ -7,55 +7,49 @@ const express_1 = __importDefault(require("express"));
 const database_1 = require("../config/database");
 const auth_1 = require("../middleware/auth");
 const router = express_1.default.Router();
-// Get all companies
-router.get('/', auth_1.authenticateToken, async (req, res) => {
+// Get all companies - from tallac_partners, tallac_organizations and tallac_leads
+// Allow without auth for search functionality
+router.get('/', async (req, res) => {
     try {
-        const { search, status, territory_id, limit = 100, offset = 0 } = req.query;
+        const { search, limit = 1000 } = req.query;
+        // Get companies from tallac_partners (partners are companies)
         let query = `
       SELECT 
-        c.*,
-        t.territory_name,
-        o.organization_name
-      FROM companies c
-      LEFT JOIN tallac_territories t ON c.territory_id = t.id
-      LEFT JOIN tallac_organizations o ON c.organization_id = o.id
-      WHERE 1=1
+        p.partner_name as company_name,
+        p.partner_name as name,
+        p.id as partner_id,
+        p.partner_code,
+        p.partner_address,
+        p.partner_city,
+        p.partner_state,
+        p.partner_status
+      FROM tallac_partners p
+      WHERE p.partner_name IS NOT NULL
     `;
         const params = [];
         let paramCount = 1;
         if (search) {
-            // Search in company_name, doing_business_as, and industry fields
             query += ` AND (
-        c.company_name ILIKE $${paramCount} 
-        OR c.doing_business_as ILIKE $${paramCount} 
-        OR c.industry ILIKE $${paramCount}
+        p.partner_name ILIKE $${paramCount} 
+        OR p.partner_code ILIKE $${paramCount}
+        OR p.partner_address ILIKE $${paramCount}
       )`;
             params.push(`%${search}%`);
             paramCount++;
         }
-        if (status && status !== 'all') {
-            query += ` AND c.status = $${paramCount}`;
-            params.push(status);
-            paramCount++;
-        }
-        if (territory_id) {
-            query += ` AND c.territory_id = $${paramCount}`;
-            params.push(territory_id);
-            paramCount++;
-        }
-        query += ` ORDER BY c.created_at DESC LIMIT $${paramCount} OFFSET $${paramCount + 1}`;
-        params.push(limit, offset);
+        query += ` ORDER BY p.partner_name LIMIT $${paramCount}`;
+        params.push(parseInt(limit));
         const result = await database_1.pool.query(query, params);
-        // Map database fields to API response format (support both formats)
+        // Map database fields to API response format
         const mappedRows = result.rows.map(row => ({
-            ...row,
-            // Support both name and company_name
-            name: row.company_name || row.name,
-            // Support both industries (plural) and industry (singular)
-            industries: row.industry || row.industries,
-            // Keep original fields for backward compatibility
-            company_name: row.company_name || row.name,
-            industry: row.industry || row.industries,
+            id: row.partner_id,
+            company_name: row.company_name,
+            name: row.company_name,
+            partner_code: row.partner_code,
+            partner_address: row.partner_address,
+            partner_city: row.partner_city,
+            partner_state: row.partner_state,
+            partner_status: row.partner_status,
         }));
         res.json(mappedRows);
     }

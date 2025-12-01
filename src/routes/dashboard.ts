@@ -8,13 +8,21 @@ router.get('/stats', async (req, res) => {
   try {
     const { territory } = req.query;
     const params: any[] = [];
-    const territoryFilter = territory 
-      ? ' AND territory_id = (SELECT id FROM tallac_territories WHERE territory_name = $1)'
-      : '';
+    let territoryId: string | null = null;
     
+    // Performance optimization: Get territory ID once instead of subquery in each query
     if (territory) {
-      params.push(territory);
+      const territoryResult = await pool.query(
+        'SELECT id FROM tallac_territories WHERE territory_name = $1 LIMIT 1',
+        [territory]
+      );
+      if (territoryResult.rows.length > 0) {
+        territoryId = territoryResult.rows[0].id;
+        params.push(territoryId);
+      }
     }
+    
+    const territoryFilter = territoryId ? ' AND territory_id = $1' : '';
     
     // Weekly start date
     const weekStart = new Date();
@@ -53,26 +61,31 @@ router.get('/stats', async (req, res) => {
         LEFT JOIN activity_statuses s ON a.status_id = s.id
       `),
       
-      // Today's performance metrics - single query
+      // Today's performance metrics - optimized single query with FILTER
       pool.query(`
         SELECT 
-          (SELECT COUNT(*) FROM tallac_call_logs WHERE call_date = CURRENT_DATE AND call_type IN ('Outgoing', 'Manual Log')) as calls_today,
-          (SELECT COUNT(*) FROM tallac_call_logs WHERE call_date = CURRENT_DATE - INTERVAL '1 day' AND call_type IN ('Outgoing', 'Manual Log')) as calls_yesterday,
-          (SELECT COUNT(*) FROM tallac_activities WHERE scheduled_date = CURRENT_DATE AND (description ILIKE '%email%' OR description ILIKE '%sent%')) as emails_today,
-          (SELECT COUNT(*) FROM tallac_activities WHERE scheduled_date = CURRENT_DATE - INTERVAL '1 day' AND (description ILIKE '%email%' OR description ILIKE '%sent%')) as emails_yesterday,
-          (SELECT COUNT(*) FROM tallac_activities WHERE activity_type = 'Appointment' AND scheduled_date = CURRENT_DATE) as appointments_today,
-          (SELECT COUNT(*) FROM tallac_activities WHERE activity_type = 'Appointment' AND scheduled_date = CURRENT_DATE - INTERVAL '1 day') as appointments_yesterday,
-          (SELECT COUNT(*) FROM tallac_leads WHERE status IN ('Closed Won', 'Won') AND DATE(updated_at) = CURRENT_DATE) as deals_today,
-          (SELECT COUNT(*) FROM tallac_leads WHERE status IN ('Closed Won', 'Won') AND DATE(updated_at) = CURRENT_DATE - INTERVAL '1 day') as deals_yesterday
+          COUNT(*) FILTER (WHERE cl.call_date = CURRENT_DATE AND cl.call_type IN ('Outgoing', 'Manual Log')) as calls_today,
+          COUNT(*) FILTER (WHERE cl.call_date = CURRENT_DATE - INTERVAL '1 day' AND cl.call_type IN ('Outgoing', 'Manual Log')) as calls_yesterday,
+          COUNT(*) FILTER (WHERE a.scheduled_date = CURRENT_DATE AND (a.description ILIKE '%email%' OR a.description ILIKE '%sent%')) as emails_today,
+          COUNT(*) FILTER (WHERE a.scheduled_date = CURRENT_DATE - INTERVAL '1 day' AND (a.description ILIKE '%email%' OR a.description ILIKE '%sent%')) as emails_yesterday,
+          COUNT(*) FILTER (WHERE a.activity_type = 'Appointment' AND a.scheduled_date = CURRENT_DATE) as appointments_today,
+          COUNT(*) FILTER (WHERE a.activity_type = 'Appointment' AND a.scheduled_date = CURRENT_DATE - INTERVAL '1 day') as appointments_yesterday,
+          COUNT(*) FILTER (WHERE l.status IN ('Closed Won', 'Won') AND DATE(l.updated_at) = CURRENT_DATE) as deals_today,
+          COUNT(*) FILTER (WHERE l.status IN ('Closed Won', 'Won') AND DATE(l.updated_at) = CURRENT_DATE - INTERVAL '1 day') as deals_yesterday
+        FROM tallac_call_logs cl
+        FULL OUTER JOIN tallac_activities a ON FALSE
+        FULL OUTER JOIN tallac_leads l ON FALSE
       `),
       
-      // Weekly performance - single query
+      // Weekly performance - optimized single query with FILTER
       pool.query(`
         SELECT 
-          (SELECT COUNT(*) FROM tallac_leads WHERE DATE(created_at) >= $1) as new_prospects,
+          COUNT(*) FILTER (WHERE DATE(created_at) >= $1) as new_prospects,
           (SELECT COUNT(*) FROM tallac_activities WHERE scheduled_date >= $1) as total_activities,
-          (SELECT COUNT(*) FROM tallac_leads WHERE status IN ('Contacted', 'Interested', 'Proposal', 'Closed Won') AND DATE(updated_at) >= $1) as contacted_week,
-          (SELECT COUNT(*) FROM tallac_leads WHERE status IN ('Closed Won', 'Won') AND DATE(updated_at) >= $1) as won_deals_week
+          COUNT(*) FILTER (WHERE status IN ('Contacted', 'Interested', 'Proposal', 'Closed Won') AND DATE(updated_at) >= $1) as contacted_week,
+          COUNT(*) FILTER (WHERE status IN ('Closed Won', 'Won') AND DATE(updated_at) >= $1) as won_deals_week
+        FROM tallac_leads
+        WHERE 1=1
       `, [weekStartStr])
     ]);
     

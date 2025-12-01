@@ -6,6 +6,41 @@ Object.defineProperty(exports, "__esModule", { value: true });
 const express_1 = __importDefault(require("express"));
 const database_1 = require("../config/database");
 const router = express_1.default.Router();
+// Get simple status summary for fast pipeline counts on Prospects page
+router.get('/summary', async (req, res) => {
+    try {
+        const summaryQuery = `
+      SELECT LOWER(status) as status, COUNT(*)::int as count
+      FROM tallac_leads
+      GROUP BY LOWER(status)
+    `;
+        const result = await database_1.pool.query(summaryQuery);
+        const counts = {
+            new: 0,
+            contacted: 0,
+            interested: 0,
+            proposal: 0,
+            won: 0,
+            lost: 0,
+        };
+        result.rows.forEach((row) => {
+            const rawStatus = (row.status || '').toLowerCase();
+            let mapped = rawStatus;
+            if (rawStatus === 'closed won')
+                mapped = 'won';
+            else if (rawStatus === 'closed lost')
+                mapped = 'lost';
+            if (mapped in counts) {
+                counts[mapped] += row.count || 0;
+            }
+        });
+        return res.json(counts);
+    }
+    catch (error) {
+        console.error('Error fetching lead summary:', error);
+        return res.status(500).json({ error: 'Internal server error' });
+    }
+});
 // Get pipeline counts
 router.get('/pipeline-counts', async (req, res) => {
     try {
@@ -48,7 +83,25 @@ router.get('/', async (req, res) => {
         const { status_filter, territory, industry, owner, search_text, limit = 1000, start = 0, } = req.query;
         let query = `
       SELECT 
-        l.*,
+        l.id,
+        l.name,
+        l.organization_id,
+        l.company_name,
+        l.industry,
+        l.status,
+        l.lead_owner_id,
+        l.assigned_to_id,
+        l.primary_contact_id,
+        l.primary_contact_name,
+        l.primary_title,
+        l.primary_phone,
+        l.primary_email,
+        l.zip_code,
+        l.city,
+        l.state,
+        l.territory_id,
+        l.created_at,
+        l.updated_at,
         u1.full_name as assigned_to_name,
         u2.full_name as lead_owner_name,
         t.territory_name,
@@ -138,19 +191,44 @@ router.get('/', async (req, res) => {
         query += ` ORDER BY l.updated_at DESC LIMIT $${paramCount + 1} OFFSET $${paramCount + 2}`;
         params.push(parseInt(limit), parseInt(start));
         const result = await database_1.pool.query(query, params);
-        // Get contact paths for each lead
-        for (const lead of result.rows) {
-            const contactPathQuery = `
+        // Get contacts for all leads using tallac_lead_contacts (simple lookup)
+        if (result.rows.length > 0) {
+            const leadIds = result.rows.map((lead) => lead.id);
+            const contactsQuery = `
         SELECT 
-          cp.contact_name,
-          cp.status,
-          cp.sequence
-        FROM tallac_lead_contact_paths cp
-        WHERE cp.lead_id = $1
-        ORDER BY cp.sequence ASC
+          lc.lead_id,
+          c.id,
+          c.full_name as name,
+          c.email,
+          COALESCE(c.mobile, c.phone) as phone,
+          c.job_title as designation,
+          lc.sequence,
+          lc.contact_id
+        FROM tallac_lead_contacts lc
+        LEFT JOIN tallac_contacts c ON lc.contact_id = c.id
+        WHERE lc.lead_id = ANY($1)
+        ORDER BY lc.lead_id, lc.sequence ASC
       `;
-            const contactPathResult = await database_1.pool.query(contactPathQuery, [lead.id]);
-            lead.contact_path = contactPathResult.rows;
+            const contactsResult = await database_1.pool.query(contactsQuery, [leadIds]);
+            // Group contacts by lead_id
+            const contactsByLeadId = {};
+            contactsResult.rows.forEach((contact) => {
+                if (!contactsByLeadId[contact.lead_id]) {
+                    contactsByLeadId[contact.lead_id] = [];
+                }
+                contactsByLeadId[contact.lead_id].push({
+                    id: contact.contact_id,
+                    name: contact.name,
+                    email: contact.email,
+                    phone: contact.phone,
+                    designation: contact.designation,
+                    sequence: contact.sequence
+                });
+            });
+            // Attach contacts to leads as contact_path (for compatibility)
+            result.rows.forEach((lead) => {
+                lead.contact_path = contactsByLeadId[lead.id] || [];
+            });
         }
         res.json(result.rows);
     }
@@ -165,7 +243,25 @@ router.get('/:id', async (req, res) => {
         const { id } = req.params;
         const query = `
       SELECT 
-        l.*,
+        l.id,
+        l.name,
+        l.organization_id,
+        l.company_name,
+        l.industry,
+        l.status,
+        l.lead_owner_id,
+        l.assigned_to_id,
+        l.primary_contact_id,
+        l.primary_contact_name,
+        l.primary_title,
+        l.primary_phone,
+        l.primary_email,
+        l.zip_code,
+        l.city,
+        l.state,
+        l.territory_id,
+        l.created_at,
+        l.updated_at,
         u1.full_name as assigned_to_name,
         u2.full_name as lead_owner_name,
         t.territory_name,
@@ -185,18 +281,30 @@ router.get('/:id', async (req, res) => {
             return res.status(404).json({ error: 'Lead not found' });
         }
         const lead = result.rows[0];
-        // Get contact paths
-        const contactPathQuery = `
+        // Get contacts for this lead using tallac_lead_contacts
+        const contactsQuery = `
       SELECT 
-        cp.contact_name,
-        cp.status,
-        cp.sequence
-      FROM tallac_lead_contact_paths cp
-      WHERE cp.lead_id = $1
-      ORDER BY cp.sequence ASC
+        c.id,
+        c.full_name as name,
+        c.email,
+        COALESCE(c.mobile, c.phone) as phone,
+        c.job_title as designation,
+        lc.sequence,
+        lc.contact_id
+      FROM tallac_lead_contacts lc
+      LEFT JOIN tallac_contacts c ON lc.contact_id = c.id
+      WHERE lc.lead_id = $1
+      ORDER BY lc.sequence ASC
     `;
-        const contactPathResult = await database_1.pool.query(contactPathQuery, [lead.id]);
-        lead.contact_path = contactPathResult.rows;
+        const contactsResult = await database_1.pool.query(contactsQuery, [lead.id]);
+        lead.contact_path = contactsResult.rows.map(contact => ({
+            id: contact.contact_id,
+            name: contact.name,
+            email: contact.email,
+            phone: contact.phone,
+            designation: contact.designation,
+            sequence: contact.sequence
+        }));
         res.json(lead);
     }
     catch (error) {
@@ -208,33 +316,198 @@ router.get('/:id', async (req, res) => {
 router.post('/', async (req, res) => {
     try {
         const leadData = req.body;
-        // Generate name (TLEAD-00001 format)
-        const nameQuery = await database_1.pool.query('SELECT COUNT(*) as count FROM tallac_leads');
-        const count = parseInt(nameQuery.rows[0].count) + 1;
-        const name = `TLEAD-${String(count).padStart(5, '0')}`;
+        // Validate zip code is provided (mandatory only if territory is not selected)
+        if (!leadData.territory_id && (!leadData.zip_code || !leadData.zip_code.trim())) {
+            return res.status(400).json({ error: 'ZIP code is required when territory is not selected' });
+        }
+        // Find territory from zip code
+        let territoryId = leadData.territory_id || null;
+        let territoryOwnerId = null;
+        // If territory_id is already provided, use it; otherwise try to find from zip_code
+        if (leadData.territory_id) {
+            territoryId = leadData.territory_id;
+        }
+        else if (leadData.zip_code && leadData.zip_code.trim()) {
+            const territoryQuery = `
+        SELECT tz.territory_id, t.territory_name
+        FROM territory_zip_codes tz
+        JOIN tallac_territories t ON tz.territory_id = t.id
+        WHERE tz.zip_code = $1
+        LIMIT 1
+      `;
+            const territoryResult = await database_1.pool.query(territoryQuery, [leadData.zip_code.trim()]);
+            if (territoryResult.rows.length > 0) {
+                territoryId = territoryResult.rows[0].territory_id;
+                // Performance optimization: Try both owner queries in parallel
+                const [ownerResult, fallbackResult] = await Promise.all([
+                    database_1.pool.query(`
+            SELECT u.id, u.full_name, u.role, u.tallac_role
+            FROM territory_owners to_owners
+            JOIN users u ON to_owners.owner_name = u.full_name
+            WHERE to_owners.territory_id = $1
+            AND u.role NOT IN ('Sales User', 'Tallac User')
+            AND (u.tallac_role IS NULL OR u.tallac_role NOT IN ('Sales User', 'Tallac User'))
+            AND u.is_active = true
+            LIMIT 1
+          `, [territoryId]),
+                    database_1.pool.query(`
+            SELECT u.id, u.full_name, u.role, u.tallac_role
+            FROM tallac_territories t
+            JOIN users u ON t.territory_owner = u.full_name
+            WHERE t.id = $1
+            AND u.role NOT IN ('Sales User', 'Tallac User')
+            AND (u.tallac_role IS NULL OR u.tallac_role NOT IN ('Sales User', 'Tallac User'))
+            AND u.is_active = true
+            LIMIT 1
+          `, [territoryId])
+                ]);
+                if (ownerResult.rows.length > 0) {
+                    territoryOwnerId = ownerResult.rows[0].id;
+                }
+                else if (fallbackResult.rows.length > 0) {
+                    territoryOwnerId = fallbackResult.rows[0].id;
+                }
+            }
+        }
+        // If territory is selected but no owner found yet, try to find owner
+        if (territoryId && !territoryOwnerId) {
+            const [ownerResult, fallbackResult] = await Promise.all([
+                database_1.pool.query(`
+          SELECT u.id, u.full_name, u.role, u.tallac_role
+          FROM territory_owners to_owners
+          JOIN users u ON to_owners.owner_name = u.full_name
+          WHERE to_owners.territory_id = $1
+          AND u.role NOT IN ('Sales User', 'Tallac User')
+          AND (u.tallac_role IS NULL OR u.tallac_role NOT IN ('Sales User', 'Tallac User'))
+          AND u.is_active = true
+          LIMIT 1
+        `, [territoryId]),
+                database_1.pool.query(`
+          SELECT u.id, u.full_name, u.role, u.tallac_role
+          FROM tallac_territories t
+          JOIN users u ON t.territory_owner = u.full_name
+          WHERE t.id = $1
+          AND u.role NOT IN ('Sales User', 'Tallac User')
+          AND (u.tallac_role IS NULL OR u.tallac_role NOT IN ('Sales User', 'Tallac User'))
+          AND u.is_active = true
+          LIMIT 1
+        `, [territoryId])
+            ]);
+            if (ownerResult.rows.length > 0) {
+                territoryOwnerId = ownerResult.rows[0].id;
+            }
+            else if (fallbackResult.rows.length > 0) {
+                territoryOwnerId = fallbackResult.rows[0].id;
+            }
+        }
+        // Handle contact - get or create from tallac_contacts table
+        let primaryContactId = null;
+        if (leadData.selectedContact && leadData.selectedContact.id) {
+            // Contact selected from dropdown - use existing contact
+            primaryContactId = leadData.selectedContact.id;
+        }
+        else if (leadData.primary_contact_name || leadData.primary_email) {
+            // Check if contact exists by email or name
+            const existingContactQuery = `
+        SELECT id FROM tallac_contacts 
+        WHERE (email = $1 AND email IS NOT NULL) 
+           OR (full_name = $2 AND full_name IS NOT NULL)
+        LIMIT 1
+      `;
+            const existingContactResult = await database_1.pool.query(existingContactQuery, [
+                leadData.primary_email || leadData.email,
+                leadData.primary_contact_name || leadData.contact_name
+            ]);
+            if (existingContactResult.rows.length > 0) {
+                primaryContactId = existingContactResult.rows[0].id;
+            }
+            else {
+                // Create new contact in tallac_contacts
+                const contactName = leadData.primary_contact_name || leadData.contact_name || 'Unknown';
+                const contactEmail = leadData.primary_email || leadData.email || null;
+                const contactPhone = leadData.primary_phone || leadData.phone || null;
+                const contactMobile = leadData.primary_mobile || leadData.mobile || contactPhone;
+                const contactTitle = leadData.primary_title || leadData.title || leadData.designation || null;
+                const createContactQuery = `
+          INSERT INTO tallac_contacts (
+            full_name, email, phone, mobile, job_title, created_at, updated_at
+          ) VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+          RETURNING id
+        `;
+                const newContactResult = await database_1.pool.query(createContactQuery, [
+                    contactName,
+                    contactEmail,
+                    contactPhone,
+                    contactMobile,
+                    contactTitle
+                ]);
+                primaryContactId = newContactResult.rows[0].id;
+            }
+        }
+        // Generate name (TLEAD-00001 format) - optimized using MAX instead of COUNT
+        const nameQuery = await database_1.pool.query(`SELECT COALESCE(MAX(CAST(SUBSTRING(name FROM 'TLEAD-(\\d+)') AS INTEGER)), 0) + 1 as next_num FROM tallac_leads WHERE name ~ '^TLEAD-\\d+$'`);
+        const nextNum = parseInt(nameQuery.rows[0].next_num) || 1;
+        const name = `TLEAD-${String(nextNum).padStart(5, '0')}`;
+        // Get contact details for lead table (for backward compatibility)
+        let contactName = null;
+        let contactTitle = null;
+        let contactPhone = null;
+        let contactEmail = null;
+        if (primaryContactId) {
+            const contactDetailsQuery = await database_1.pool.query('SELECT full_name, job_title, phone, mobile, email FROM tallac_contacts WHERE id = $1', [primaryContactId]);
+            if (contactDetailsQuery.rows.length > 0) {
+                const contact = contactDetailsQuery.rows[0];
+                contactName = contact.full_name;
+                contactTitle = contact.job_title;
+                contactPhone = contact.phone || contact.mobile;
+                contactEmail = contact.email;
+            }
+        }
         const insertQuery = `
       INSERT INTO tallac_leads (
         name, company_name, industry, status, organization_id,
-        territory_id, primary_contact_name, primary_title,
-        primary_phone, primary_email, city, state, zip_code
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        territory_id, lead_owner_id, primary_contact_id, primary_contact_name, primary_title,
+        primary_phone, primary_email, city, state, zip_code, full_address
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
       RETURNING *
     `;
+        // Build full address
+        const addressParts = [
+            leadData.address,
+            leadData.city,
+            leadData.state,
+            leadData.zip_code
+        ].filter(Boolean);
+        const fullAddress = addressParts.join(', ');
         const result = await database_1.pool.query(insertQuery, [
             name,
-            leadData.company_name,
+            leadData.company_name || leadData.selectedCompany?.company_name,
             leadData.industry || null,
             leadData.status || 'New',
-            leadData.organization_id || null,
-            leadData.territory_id || null,
-            leadData.primary_contact_name || null,
-            leadData.primary_title || null,
-            leadData.primary_phone || null,
-            leadData.primary_email || null,
+            leadData.organization_id || leadData.selectedCompany?.id || null,
+            territoryId,
+            territoryOwnerId, // Auto-assigned based on territory
+            primaryContactId, // Contact ID from tallac_contacts
+            contactName, // For backward compatibility
+            contactTitle,
+            contactPhone,
+            contactEmail,
             leadData.city || null,
             leadData.state || null,
             leadData.zip_code || null,
+            fullAddress || null,
         ]);
+        const newLead = result.rows[0];
+        // Link contact to lead in tallac_lead_contacts (if contact exists)
+        if (primaryContactId) {
+            const linkContactQuery = `
+        INSERT INTO tallac_lead_contacts (
+          lead_id, contact_id, sequence, created_at
+        ) VALUES ($1, $2, 0, CURRENT_TIMESTAMP)
+        ON CONFLICT DO NOTHING
+      `;
+            await database_1.pool.query(linkContactQuery, [newLead.id, primaryContactId]);
+        }
         res.status(201).json(result.rows[0]);
     }
     catch (error) {

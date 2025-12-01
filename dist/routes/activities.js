@@ -6,6 +6,52 @@ Object.defineProperty(exports, "__esModule", { value: true });
 const express_1 = __importDefault(require("express"));
 const database_1 = require("../config/database");
 const router = express_1.default.Router();
+// Get high-level activity summary for fast counts on Activities page
+router.get('/summary', async (req, res) => {
+    try {
+        const summaryQuery = `
+      SELECT
+        COUNT(*)::int as total_count,
+        COUNT(*) FILTER (WHERE queue_status IN ('overdue', 'today'))::int as queue_count,
+        COUNT(*) FILTER (WHERE queue_status = 'scheduled')::int as scheduled_count,
+        COUNT(*) FILTER (WHERE LOWER(activity_type) = 'call-log')::int as call_log_count,
+        COUNT(*) FILTER (WHERE LOWER(activity_type) = 'callback')::int as callback_count,
+        COUNT(*) FILTER (WHERE LOWER(activity_type) = 'appointment')::int as appointment_count,
+        COUNT(*) FILTER (WHERE LOWER(activity_type) IN ('note', 'notes'))::int as note_count,
+        COUNT(*) FILTER (WHERE LOWER(activity_type) = 'changes')::int as changes_count,
+        COUNT(*) FILTER (WHERE LOWER(activity_type) = 'assignment')::int as assignment_count
+      FROM (
+        SELECT 
+          a.activity_type,
+          CASE 
+            WHEN a.scheduled_date < CURRENT_DATE AND s.status_name IN ('Open', 'In Progress') THEN 'overdue'
+            WHEN a.scheduled_date = CURRENT_DATE AND s.status_name IN ('Open', 'In Progress') THEN 'today'
+            WHEN a.scheduled_date > CURRENT_DATE AND s.status_name IN ('Open', 'In Progress') THEN 'scheduled'
+            ELSE 'none'
+          END as queue_status
+        FROM tallac_activities a
+        LEFT JOIN activity_statuses s ON a.status_id = s.id
+      ) x;
+    `;
+        const result = await database_1.pool.query(summaryQuery);
+        const row = result.rows[0] || {};
+        return res.json({
+            total_count: row.total_count || 0,
+            queue_count: row.queue_count || 0,
+            scheduled_count: row.scheduled_count || 0,
+            call_log_count: row.call_log_count || 0,
+            callback_count: row.callback_count || 0,
+            appointment_count: row.appointment_count || 0,
+            note_count: row.note_count || 0,
+            changes_count: row.changes_count || 0,
+            assignment_count: row.assignment_count || 0,
+        });
+    }
+    catch (error) {
+        console.error('Error fetching activities summary:', error);
+        return res.status(500).json({ error: 'Internal server error' });
+    }
+});
 // Get timeline activities
 router.get('/timeline', async (req, res) => {
     try {
@@ -16,82 +62,82 @@ router.get('/timeline', async (req, res) => {
         const types = activity_types
             ? (typeof activity_types === 'string' ? JSON.parse(activity_types) : activity_types)
             : ['activity', 'call_log', 'note'];
-        const activities = [];
+        // Performance optimization: Run all queries in parallel instead of sequentially
+        const queryPromises = [];
         // Get Tallac Activities
         if (types.includes('activity')) {
-            const query = `
-        SELECT 
-          a.*,
-          s.status_name,
-          u.full_name as assigned_to_name,
-          c.full_name as contact_name,
-          o.organization_name
-        FROM tallac_activities a
-        LEFT JOIN activity_statuses s ON a.status_id = s.id
-        LEFT JOIN users u ON a.assigned_to_id = u.id
-        LEFT JOIN tallac_contacts c ON a.contact_person_id = c.id
-        LEFT JOIN tallac_organizations o ON a.organization_id = o.id
-        WHERE a.reference_doctype = $1 AND a.reference_docname = $2
-        ORDER BY a.scheduled_date DESC, a.scheduled_time DESC
-        LIMIT $3
-      `;
-            const result = await database_1.pool.query(query, [reference_doctype, reference_docname, limit]);
-            result.rows.forEach((row) => {
-                activities.push({
-                    ...row,
-                    timeline_type: 'activity',
-                    display_date: row.scheduled_date || row.created_at,
-                });
-            });
+            queryPromises.push(database_1.pool.query(`
+          SELECT 
+            a.*,
+            s.status_name,
+            u.full_name as assigned_to_name,
+            c.full_name as contact_name,
+            o.organization_name,
+            'activity' as timeline_type,
+            COALESCE(a.scheduled_date, a.created_at) as display_date
+          FROM tallac_activities a
+          LEFT JOIN activity_statuses s ON a.status_id = s.id
+          LEFT JOIN users u ON a.assigned_to_id = u.id
+          LEFT JOIN tallac_contacts c ON a.contact_person_id = c.id
+          LEFT JOIN tallac_organizations o ON a.organization_id = o.id
+          WHERE a.reference_doctype = $1 AND a.reference_docname = $2
+          ORDER BY a.scheduled_date DESC, a.scheduled_time DESC
+          LIMIT $3
+        `, [reference_doctype, reference_docname, limit]));
+        }
+        else {
+            queryPromises.push(Promise.resolve({ rows: [] }));
         }
         // Get Call Logs
         if (types.includes('call_log')) {
-            const query = `
-        SELECT 
-          cl.*,
-          cs.status_name as call_status_name,
-          u.full_name as handled_by_name,
-          c.full_name as contact_name,
-          o.organization_name
-        FROM tallac_call_logs cl
-        LEFT JOIN call_statuses cs ON cl.call_status_id = cs.id
-        LEFT JOIN users u ON cl.handled_by_id = u.id
-        LEFT JOIN tallac_contacts c ON cl.contact_person_id = c.id
-        LEFT JOIN tallac_organizations o ON cl.organization_id = o.id
-        WHERE cl.reference_doctype = $1 AND cl.reference_docname = $2
-        ORDER BY cl.call_date DESC, cl.call_time DESC
-        LIMIT $3
-      `;
-            const result = await database_1.pool.query(query, [reference_doctype, reference_docname, limit]);
-            result.rows.forEach((row) => {
-                activities.push({
-                    ...row,
-                    timeline_type: 'call_log',
-                    display_date: row.call_date || row.created_at,
-                });
-            });
+            queryPromises.push(database_1.pool.query(`
+          SELECT 
+            cl.*,
+            cs.status_name as call_status_name,
+            u.full_name as handled_by_name,
+            c.full_name as contact_name,
+            o.organization_name,
+            'call_log' as timeline_type,
+            COALESCE(cl.call_date, cl.created_at) as display_date
+          FROM tallac_call_logs cl
+          LEFT JOIN call_statuses cs ON cl.call_status_id = cs.id
+          LEFT JOIN users u ON cl.handled_by_id = u.id
+          LEFT JOIN tallac_contacts c ON cl.contact_person_id = c.id
+          LEFT JOIN tallac_organizations o ON cl.organization_id = o.id
+          WHERE cl.reference_doctype = $1 AND cl.reference_docname = $2
+          ORDER BY cl.call_date DESC, cl.call_time DESC
+          LIMIT $3
+        `, [reference_doctype, reference_docname, limit]));
+        }
+        else {
+            queryPromises.push(Promise.resolve({ rows: [] }));
         }
         // Get Notes
         if (types.includes('note')) {
-            const query = `
-        SELECT 
-          n.*,
-          u.full_name as created_by_name
-        FROM tallac_notes n
-        LEFT JOIN users u ON n.created_by_id = u.id
-        WHERE n.reference_doctype = $1 AND n.reference_docname = $2
-        ORDER BY n.created_at DESC
-        LIMIT $3
-      `;
-            const result = await database_1.pool.query(query, [reference_doctype, reference_docname, limit]);
-            result.rows.forEach((row) => {
-                activities.push({
-                    ...row,
-                    timeline_type: 'note',
-                    display_date: row.created_at,
-                });
-            });
+            queryPromises.push(database_1.pool.query(`
+          SELECT 
+            n.*,
+            u.full_name as created_by_name,
+            'note' as timeline_type,
+            n.created_at as display_date
+          FROM tallac_notes n
+          LEFT JOIN users u ON n.created_by_id = u.id
+          WHERE n.reference_doctype = $1 AND n.reference_docname = $2
+          ORDER BY n.created_at DESC
+          LIMIT $3
+        `, [reference_doctype, reference_docname, limit]));
         }
+        else {
+            queryPromises.push(Promise.resolve({ rows: [] }));
+        }
+        // Execute all queries in parallel
+        const [activitiesResult, callLogsResult, notesResult] = await Promise.all(queryPromises);
+        // Combine all results
+        const activities = [
+            ...activitiesResult.rows,
+            ...callLogsResult.rows,
+            ...notesResult.rows
+        ];
         // Sort by display_date
         activities.sort((a, b) => {
             const dateA = new Date(a.display_date).getTime();
@@ -108,7 +154,7 @@ router.get('/timeline', async (req, res) => {
 // Get all activities with filters
 router.get('/', async (req, res) => {
     try {
-        const { activity_type, status, assigned_to, scheduled_date_from, scheduled_date_to, limit = 50, offset = 0, } = req.query;
+        const { activity_type, status, assigned_to, created_by, company, scheduled_date_from, scheduled_date_to, limit = 1000, offset = 0, } = req.query;
         let query = `
       SELECT 
         a.*,
@@ -116,7 +162,19 @@ router.get('/', async (req, res) => {
         u.full_name as assigned_to_name,
         u2.full_name as created_by_name,
         c.full_name as contact_name,
-        COALESCE(o.organization_name, l.company_name) as company
+        COALESCE(o.organization_name, l.company_name) as company,
+        CASE 
+          WHEN a.scheduled_date < CURRENT_DATE AND s.status_name IN ('Open', 'In Progress') THEN 'overdue'
+          WHEN a.scheduled_date = CURRENT_DATE AND s.status_name IN ('Open', 'In Progress') THEN 'today'
+          WHEN a.scheduled_date > CURRENT_DATE AND s.status_name IN ('Open', 'In Progress') THEN 'scheduled'
+          ELSE 'none'
+        END as queue_status,
+        CASE 
+          WHEN a.scheduled_date < CURRENT_DATE AND s.status_name IN ('Open', 'In Progress') THEN 'Overdue: Action required'
+          WHEN a.scheduled_date = CURRENT_DATE AND s.status_name IN ('Open', 'In Progress') THEN 'Due Today: Action required'
+          WHEN a.scheduled_date > CURRENT_DATE AND s.status_name IN ('Open', 'In Progress') THEN 'Scheduled: ' || a.scheduled_date::text
+          ELSE NULL
+        END as queue_message
       FROM tallac_activities a
       LEFT JOIN activity_statuses s ON a.status_id = s.id
       LEFT JOIN users u ON a.assigned_to_id = u.id
@@ -140,8 +198,18 @@ router.get('/', async (req, res) => {
         }
         if (assigned_to) {
             paramCount++;
-            query += ` AND a.assigned_to_id = $${paramCount}`;
+            query += ` AND u.full_name = $${paramCount}`;
             params.push(assigned_to);
+        }
+        if (created_by) {
+            paramCount++;
+            query += ` AND u2.full_name = $${paramCount}`;
+            params.push(created_by);
+        }
+        if (company) {
+            paramCount++;
+            query += ` AND (o.organization_name = $${paramCount} OR l.company_name = $${paramCount})`;
+            params.push(company);
         }
         if (scheduled_date_from) {
             paramCount++;

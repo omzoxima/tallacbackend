@@ -40,78 +40,97 @@ router.get('/', authenticateToken, async (req: AuthRequest, res) => {
 
     const result = await pool.query(query, params);
 
-    // Enrich each partner with territories and team members
-    const partners = await Promise.all(
-      result.rows.map(async (partner) => {
-        // Get territories
-        const territoriesResult = await pool.query(`
-          SELECT 
-            t.id as territory_id,
-            t.territory_name,
-            t.territory_code,
-            t.territory_status,
-            t.territory_dba,
-            t.territory_state,
-            t.territory_region,
-            COUNT(DISTINCT tzc.id) as zipcode_count
-          FROM partner_territories pt
-          JOIN tallac_territories t ON pt.territory_id = t.id
-          LEFT JOIN territory_zip_codes tzc ON t.id = tzc.territory_id
-          WHERE pt.partner_id = $1
-          GROUP BY t.id, t.territory_name, t.territory_code, t.territory_status, t.territory_dba, t.territory_state, t.territory_region
-          ORDER BY t.territory_name
-        `, [partner.id]);
+    // Performance optimization: Fetch all territories and team members in parallel queries instead of N+1
+    const partnerIds = result.rows.map(p => p.id);
+    
+    const [territoriesResult, teamMembersResult] = await Promise.all([
+      // Get all territories for all partners in one query
+      partnerIds.length > 0 ? pool.query(`
+        SELECT 
+          pt.partner_id,
+          t.id as territory_id,
+          t.territory_name,
+          t.territory_code,
+          t.territory_status,
+          t.territory_dba,
+          t.territory_state,
+          t.territory_region,
+          COUNT(DISTINCT tzc.id) as zipcode_count
+        FROM partner_territories pt
+        JOIN tallac_territories t ON pt.territory_id = t.id
+        LEFT JOIN territory_zip_codes tzc ON t.id = tzc.territory_id
+        WHERE pt.partner_id = ANY($1)
+        GROUP BY pt.partner_id, t.id, t.territory_name, t.territory_code, t.territory_status, t.territory_dba, t.territory_state, t.territory_region
+        ORDER BY pt.partner_id, t.territory_name
+      `, [partnerIds]) : Promise.resolve({ rows: [] }),
+      
+      // Get all team members for all partners in one query
+      partnerIds.length > 0 ? pool.query(`
+        SELECT 
+          ptm.partner_id,
+          ptm.member_name as name,
+          ptm.role,
+          ptm.email,
+          ptm.phone,
+          u.id as user_id,
+          u.full_name,
+          u.email as user_email
+        FROM partner_team_members ptm
+        LEFT JOIN users u ON ptm.tallac_user_id = u.id
+        WHERE ptm.partner_id = ANY($1)
+        ORDER BY ptm.partner_id, ptm.member_name
+      `, [partnerIds]) : Promise.resolve({ rows: [] })
+    ]);
+    
+    // Group territories and team members by partner_id
+    const territoriesByPartnerId: Record<string, any[]> = {};
+    territoriesResult.rows.forEach((t: any) => {
+      if (!territoriesByPartnerId[t.partner_id]) {
+        territoriesByPartnerId[t.partner_id] = [];
+      }
+      territoriesByPartnerId[t.partner_id].push({
+        territory: t.territory_id,
+        territory_name: t.territory_name,
+        territory_code: t.territory_code,
+        territory_status: t.territory_status,
+        territory_dba: t.territory_dba,
+        territory_state: t.territory_state,
+        territory_region: t.territory_region,
+        zipcode_count: parseInt(t.zipcode_count) || 0
+      });
+    });
+    
+    const teamMembersByPartnerId: Record<string, any[]> = {};
+    teamMembersResult.rows.forEach((tm: any) => {
+      if (!teamMembersByPartnerId[tm.partner_id]) {
+        teamMembersByPartnerId[tm.partner_id] = [];
+      }
+      teamMembersByPartnerId[tm.partner_id].push({
+        name: tm.name || tm.full_name,
+        role: tm.role,
+        email: tm.email || tm.user_email,
+        phone: tm.phone
+      });
+    });
+    
+    // Map partners with their territories and team members
+    const partners = result.rows.map((partner) => {
+      const territories = territoriesByPartnerId[partner.id] || [];
+      const teamMembers = teamMembersByPartnerId[partner.id] || [];
+      const adminCount = teamMembers.filter(m => {
+        const roleLower = (m.role || '').toLowerCase();
+        return roleLower.includes('admin') || roleLower.includes('owner') || roleLower.includes('director');
+      }).length;
 
-        const territories = territoriesResult.rows.map(t => ({
-          territory: t.territory_id,
-          territory_name: t.territory_name,
-          territory_code: t.territory_code,
-          territory_status: t.territory_status,
-          territory_dba: t.territory_dba,
-          territory_state: t.territory_state,
-          territory_region: t.territory_region,
-          zipcode_count: parseInt(t.zipcode_count) || 0
-        }));
-
-        // Get team members
-        const teamMembersResult = await pool.query(`
-          SELECT 
-            ptm.member_name as name,
-            ptm.role,
-            ptm.email,
-            ptm.phone,
-            u.id as user_id,
-            u.full_name,
-            u.email as user_email
-          FROM partner_team_members ptm
-          LEFT JOIN users u ON ptm.tallac_user_id = u.id
-          WHERE ptm.partner_id = $1
-          ORDER BY ptm.member_name
-        `, [partner.id]);
-
-        const teamMembers = teamMembersResult.rows.map(tm => ({
-          name: tm.name || tm.full_name,
-          role: tm.role,
-          email: tm.email || tm.user_email,
-          phone: tm.phone
-        }));
-
-        // Count admins
-        const adminCount = teamMembers.filter(m => {
-          const roleLower = (m.role || '').toLowerCase();
-          return roleLower.includes('admin') || roleLower.includes('owner') || roleLower.includes('director');
-        }).length;
-
-        return {
-          ...partner,
-          territories,
-          territory_count: territories.length,
-          team_members: teamMembers,
-          team_count: teamMembers.length,
-          admin_count: adminCount
-        };
-      })
-    );
+      return {
+        ...partner,
+        territories,
+        territory_count: territories.length,
+        team_members: teamMembers,
+        team_count: teamMembers.length,
+        admin_count: adminCount
+      };
+    });
 
     res.json(partners);
   } catch (error) {
@@ -136,24 +155,41 @@ router.get('/:id', authenticateToken, async (req: AuthRequest, res) => {
 
     const partner = result.rows[0];
 
-    // Get territories
-    const territoriesResult = await pool.query(`
-      SELECT 
-        t.id as territory_id,
-        t.territory_name,
-        t.territory_code,
-        t.territory_status,
-        t.territory_dba,
-        t.territory_state,
-        t.territory_region,
-        COUNT(DISTINCT tzc.id) as zipcode_count
-      FROM partner_territories pt
-      JOIN tallac_territories t ON pt.territory_id = t.id
-      LEFT JOIN territory_zip_codes tzc ON t.id = tzc.territory_id
-      WHERE pt.partner_id = $1
-      GROUP BY t.id, t.territory_name, t.territory_code, t.territory_status, t.territory_dba, t.territory_state, t.territory_region
-      ORDER BY t.territory_name
-    `, [partner.id]);
+    // Performance optimization: Fetch territories and team members in parallel
+    const [territoriesResult, teamMembersResult] = await Promise.all([
+      pool.query(`
+        SELECT 
+          t.id as territory_id,
+          t.territory_name,
+          t.territory_code,
+          t.territory_status,
+          t.territory_dba,
+          t.territory_state,
+          t.territory_region,
+          COUNT(DISTINCT tzc.id) as zipcode_count
+        FROM partner_territories pt
+        JOIN tallac_territories t ON pt.territory_id = t.id
+        LEFT JOIN territory_zip_codes tzc ON t.id = tzc.territory_id
+        WHERE pt.partner_id = $1
+        GROUP BY t.id, t.territory_name, t.territory_code, t.territory_status, t.territory_dba, t.territory_state, t.territory_region
+        ORDER BY t.territory_name
+      `, [partner.id]),
+      
+      pool.query(`
+        SELECT 
+          ptm.member_name as name,
+          ptm.role,
+          ptm.email,
+          ptm.phone,
+          u.id as user_id,
+          u.full_name,
+          u.email as user_email
+        FROM partner_team_members ptm
+        LEFT JOIN users u ON ptm.tallac_user_id = u.id
+        WHERE ptm.partner_id = $1
+        ORDER BY ptm.member_name
+      `, [partner.id])
+    ]);
 
     const territories = territoriesResult.rows.map(t => ({
       territory: t.territory_id,
@@ -165,22 +201,6 @@ router.get('/:id', authenticateToken, async (req: AuthRequest, res) => {
       territory_region: t.territory_region,
       zipcode_count: parseInt(t.zipcode_count) || 0
     }));
-
-    // Get team members
-    const teamMembersResult = await pool.query(`
-      SELECT 
-        ptm.member_name as name,
-        ptm.role,
-        ptm.email,
-        ptm.phone,
-        u.id as user_id,
-        u.full_name,
-        u.email as user_email
-      FROM partner_team_members ptm
-      LEFT JOIN users u ON ptm.tallac_user_id = u.id
-      WHERE ptm.partner_id = $1
-      ORDER BY ptm.member_name
-    `, [partner.id]);
 
     const teamMembers = teamMembersResult.rows.map(tm => ({
       name: tm.name || tm.full_name,

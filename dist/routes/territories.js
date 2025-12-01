@@ -9,7 +9,8 @@ const auth_1 = require("../middleware/auth");
 const router = express_1.default.Router();
 const zipCodePattern = /^\d{5}$/;
 // Get all territories with owners and zip codes
-router.get('/', auth_1.authenticateToken, async (req, res) => {
+// Allow without auth for search functionality in modals
+router.get('/', async (req, res) => {
     try {
         const { search, status } = req.query;
         let query = 'SELECT * FROM tallac_territories WHERE 1=1';
@@ -27,25 +28,62 @@ router.get('/', auth_1.authenticateToken, async (req, res) => {
         }
         query += ' ORDER BY territory_name';
         const result = await database_1.pool.query(query, params);
-        // Fetch owners, zip codes, partners, and counts for each territory
-        const territories = await Promise.all(result.rows.map(async (territory) => {
-            const ownersResult = await database_1.pool.query('SELECT * FROM territory_owners WHERE territory_id = $1 ORDER BY owner_name', [territory.id]);
-            const zipCodesResult = await database_1.pool.query('SELECT * FROM territory_zip_codes WHERE territory_id = $1 ORDER BY zip_code', [territory.id]);
-            // Get partners for this territory
-            const partnersResult = await database_1.pool.query(`
-          SELECT 
-            p.id,
-            p.name,
-            p.partner_name,
-            p.partner_code,
-            p.partner_address as address,
-            COALESCE(pt.is_primary, false) as is_primary
-          FROM partner_territories pt
-          JOIN tallac_partners p ON pt.partner_id = p.id
-          WHERE pt.territory_id = $1
-          ORDER BY COALESCE(pt.is_primary, false) DESC, p.partner_name
-        `, [territory.id]);
-            // Map territory fields to match frontend expectations
+        // Performance optimization: Fetch all owners, zip codes, and partners in parallel queries instead of N+1
+        const territoryIds = result.rows.map(t => t.id);
+        const [ownersResult, zipCodesResult, partnersResult] = await Promise.all([
+            // Get all owners for all territories in one query
+            territoryIds.length > 0 ? database_1.pool.query('SELECT * FROM territory_owners WHERE territory_id = ANY($1) ORDER BY territory_id, owner_name', [territoryIds]) : Promise.resolve({ rows: [] }),
+            // Get all zip codes for all territories in one query
+            territoryIds.length > 0 ? database_1.pool.query('SELECT * FROM territory_zip_codes WHERE territory_id = ANY($1) ORDER BY territory_id, zip_code', [territoryIds]) : Promise.resolve({ rows: [] }),
+            // Get all partners for all territories in one query
+            territoryIds.length > 0 ? database_1.pool.query(`
+        SELECT 
+          pt.territory_id,
+          p.id,
+          p.name,
+          p.partner_name,
+          p.partner_code,
+          p.partner_address as address,
+          COALESCE(pt.is_primary, false) as is_primary
+        FROM partner_territories pt
+        JOIN tallac_partners p ON pt.partner_id = p.id
+        WHERE pt.territory_id = ANY($1)
+        ORDER BY pt.territory_id, COALESCE(pt.is_primary, false) DESC, p.partner_name
+      `, [territoryIds]) : Promise.resolve({ rows: [] })
+        ]);
+        // Group owners, zip codes, and partners by territory_id
+        const ownersByTerritoryId = {};
+        ownersResult.rows.forEach((o) => {
+            if (!ownersByTerritoryId[o.territory_id]) {
+                ownersByTerritoryId[o.territory_id] = [];
+            }
+            ownersByTerritoryId[o.territory_id].push(o);
+        });
+        const zipCodesByTerritoryId = {};
+        zipCodesResult.rows.forEach((zc) => {
+            if (!zipCodesByTerritoryId[zc.territory_id]) {
+                zipCodesByTerritoryId[zc.territory_id] = [];
+            }
+            zipCodesByTerritoryId[zc.territory_id].push(zc);
+        });
+        const partnersByTerritoryId = {};
+        partnersResult.rows.forEach((p) => {
+            if (!partnersByTerritoryId[p.territory_id]) {
+                partnersByTerritoryId[p.territory_id] = [];
+            }
+            partnersByTerritoryId[p.territory_id].push({
+                name: p.name,
+                partner_name: p.partner_name,
+                partner_code: p.partner_code,
+                address: p.address,
+                is_primary: p.is_primary || false
+            });
+        });
+        // Map territories with their owners, zip codes, and partners
+        const territories = result.rows.map((territory) => {
+            const owners = ownersByTerritoryId[territory.id] || [];
+            const zipCodes = zipCodesByTerritoryId[territory.id] || [];
+            const partners = partnersByTerritoryId[territory.id] || [];
             return {
                 ...territory,
                 name: territory.name || territory.id, // For compatibility
@@ -54,18 +92,12 @@ router.get('/', auth_1.authenticateToken, async (req, res) => {
                 territory_code: territory.territory_code || '',
                 territory_region: territory.territory_region || '',
                 territory_state: territory.territory_state || '',
-                zipcode_count: zipCodesResult.rows.length,
-                owners: ownersResult.rows,
-                zip_codes: zipCodesResult.rows,
-                partners: partnersResult.rows.map(p => ({
-                    name: p.name,
-                    partner_name: p.partner_name,
-                    partner_code: p.partner_code,
-                    address: p.address,
-                    is_primary: p.is_primary || false
-                }))
+                zipcode_count: zipCodes.length,
+                owners,
+                zip_codes: zipCodes,
+                partners
             };
-        }));
+        });
         res.json(territories);
     }
     catch (error) {
@@ -82,9 +114,11 @@ router.get('/:id', auth_1.authenticateToken, async (req, res) => {
             return res.status(404).json({ error: 'Territory not found' });
         }
         const territory = result.rows[0];
-        // Fetch owners and zip codes
-        const ownersResult = await database_1.pool.query('SELECT * FROM territory_owners WHERE territory_id = $1 ORDER BY owner_name', [id]);
-        const zipCodesResult = await database_1.pool.query('SELECT * FROM territory_zip_codes WHERE territory_id = $1 ORDER BY zip_code', [id]);
+        // Performance optimization: Fetch owners and zip codes in parallel
+        const [ownersResult, zipCodesResult] = await Promise.all([
+            database_1.pool.query('SELECT * FROM territory_owners WHERE territory_id = $1 ORDER BY owner_name', [id]),
+            database_1.pool.query('SELECT * FROM territory_zip_codes WHERE territory_id = $1 ORDER BY zip_code', [id])
+        ]);
         res.json({
             ...territory,
             owners: ownersResult.rows,
