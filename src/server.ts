@@ -17,6 +17,8 @@ import usersRoutes from './routes/users';
 import knowledgeBaseRoutes from './routes/knowledgeBase';
 import partnersRoutes from './routes/partners';
 import callLogsRoutes from './routes/callLogs';
+import organizationsRoutes from './routes/organizations';
+import industriesRoutes from './routes/industries';
 
 dotenv.config();
 
@@ -64,6 +66,8 @@ app.use('/api/users', usersRoutes);
 app.use('/api/knowledge-base', knowledgeBaseRoutes);
 app.use('/api/partners', partnersRoutes);
 app.use('/api/call-logs', callLogsRoutes);
+app.use('/api/organizations', organizationsRoutes);
+app.use('/api/industries', industriesRoutes);
 
 // Error handling middleware
 app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {

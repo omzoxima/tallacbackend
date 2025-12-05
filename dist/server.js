@@ -21,6 +21,8 @@ const users_1 = __importDefault(require("./routes/users"));
 const knowledgeBase_1 = __importDefault(require("./routes/knowledgeBase"));
 const partners_1 = __importDefault(require("./routes/partners"));
 const callLogs_1 = __importDefault(require("./routes/callLogs"));
+const organizations_1 = __importDefault(require("./routes/organizations"));
+const industries_1 = __importDefault(require("./routes/industries"));
 dotenv_1.default.config();
 const app = (0, express_1.default)();
 const PORT = process.env.PORT || 3001;
@@ -64,6 +66,8 @@ app.use('/api/users', users_1.default);
 app.use('/api/knowledge-base', knowledgeBase_1.default);
 app.use('/api/partners', partners_1.default);
 app.use('/api/call-logs', callLogs_1.default);
+app.use('/api/organizations', organizations_1.default);
+app.use('/api/industries', industries_1.default);
 // Error handling middleware
 app.use((err, req, res, next) => {
     console.error('Error:', err);

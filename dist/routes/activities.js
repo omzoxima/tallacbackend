@@ -323,5 +323,33 @@ router.put('/:id', async (req, res) => {
         res.status(500).json({ error: 'Internal server error' });
     }
 });
+// Mark activity as complete
+router.patch('/:id/complete', async (req, res) => {
+    try {
+        const { id } = req.params;
+        // Get 'Completed' status ID
+        const statusQuery = await database_1.pool.query('SELECT id FROM activity_statuses WHERE status_name = $1', ['Completed']);
+        if (statusQuery.rows.length === 0) {
+            return res.status(400).json({ error: 'Completed status not found' });
+        }
+        const completedStatusId = statusQuery.rows[0].id;
+        // Update activity status
+        const updateQuery = `
+      UPDATE tallac_activities
+      SET status_id = $1, completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+      WHERE id = $2::uuid
+      RETURNING *
+    `;
+        const result = await database_1.pool.query(updateQuery, [completedStatusId, id]);
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Activity not found' });
+        }
+        res.json({ success: true, activity: result.rows[0] });
+    }
+    catch (error) {
+        console.error('Error completing activity:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
 exports.default = router;
 //# sourceMappingURL=activities.js.map

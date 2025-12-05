@@ -737,6 +737,45 @@ router.post('/:id/assign', async (req, res) => {
         });
     }
 });
+// Update lead status
+router.patch('/:id/status', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { status } = req.body;
+        if (!status) {
+            return res.status(400).json({ error: 'Status is required' });
+        }
+        console.log('📥 Status update request:', { lead_id: id, new_status: status });
+        // Update status in tallac_leads table
+        const query = `
+      UPDATE tallac_leads
+      SET status = $1, 
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = $2::uuid
+      RETURNING id, name, company_name, status
+    `;
+        const result = await database_1.pool.query(query, [status, id]);
+        if (result.rows.length === 0) {
+            return res.status(404).json({
+                error: 'Lead not found',
+                provided_id: id
+            });
+        }
+        console.log(`✅ Lead status updated: ${result.rows[0]?.name} -> ${status}`);
+        res.json({
+            success: true,
+            message: 'Status updated successfully',
+            lead: result.rows[0]
+        });
+    }
+    catch (error) {
+        console.error('❌ Error updating lead status:', error);
+        res.status(500).json({
+            error: 'Internal server error',
+            details: process.env.NODE_ENV === 'development' ? error.message : undefined
+        });
+    }
+});
 // Delete lead
 router.delete('/:id', async (req, res) => {
     try {
