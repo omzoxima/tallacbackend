@@ -1,0 +1,89 @@
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+const express_1 = __importDefault(require("express"));
+const cors_1 = __importDefault(require("cors"));
+const helmet_1 = __importDefault(require("helmet"));
+const morgan_1 = __importDefault(require("morgan"));
+const dotenv_1 = __importDefault(require("dotenv"));
+const database_1 = require("./config/database");
+// Import routes
+const leads_1 = __importDefault(require("./routes/leads"));
+const activities_1 = __importDefault(require("./routes/activities"));
+const dashboard_1 = __importDefault(require("./routes/dashboard"));
+const auth_1 = __importDefault(require("./routes/auth"));
+const territories_1 = __importDefault(require("./routes/territories"));
+const companies_1 = __importDefault(require("./routes/companies"));
+const contacts_1 = __importDefault(require("./routes/contacts"));
+const users_1 = __importDefault(require("./routes/users"));
+const knowledgeBase_1 = __importDefault(require("./routes/knowledgeBase"));
+const partners_1 = __importDefault(require("./routes/partners"));
+const callLogs_1 = __importDefault(require("./routes/callLogs"));
+const organizations_1 = __importDefault(require("./routes/organizations"));
+const industries_1 = __importDefault(require("./routes/industries"));
+dotenv_1.default.config();
+const app = (0, express_1.default)();
+const PORT = process.env.PORT || 3001;
+// Middleware
+app.use((0, helmet_1.default)());
+app.use((0, cors_1.default)());
+app.use((0, morgan_1.default)('dev'));
+app.use(express_1.default.json());
+app.use(express_1.default.urlencoded({ extended: true }));
+// Health check
+app.get('/health', async (req, res) => {
+    try {
+        const startTime = Date.now();
+        await database_1.pool.query('SELECT NOW()');
+        const responseTime = Date.now() - startTime;
+        res.json({
+            status: 'ok',
+            database: 'connected',
+            responseTime: `${responseTime}ms`
+        });
+    }
+    catch (error) {
+        console.error('Health check failed:', error.message);
+        res.status(500).json({
+            status: 'error',
+            database: 'disconnected',
+            error: error.message,
+            code: error.code
+        });
+    }
+});
+// Routes
+app.use('/api/auth', auth_1.default);
+app.use('/api/leads', leads_1.default);
+app.use('/api/activities', activities_1.default);
+app.use('/api/dashboard', dashboard_1.default);
+app.use('/api/territories', territories_1.default);
+app.use('/api/companies', companies_1.default);
+app.use('/api/contacts', contacts_1.default);
+app.use('/api/users', users_1.default);
+app.use('/api/knowledge-base', knowledgeBase_1.default);
+app.use('/api/partners', partners_1.default);
+app.use('/api/call-logs', callLogs_1.default);
+app.use('/api/organizations', organizations_1.default);
+app.use('/api/industries', industries_1.default);
+// Error handling middleware
+app.use((err, req, res, next) => {
+    console.error('Error:', err);
+    res.status(err.status || 500).json({
+        error: {
+            message: err.message || 'Internal server error',
+            ...(process.env.NODE_ENV === 'development' && { stack: err.stack }),
+        },
+    });
+});
+// 404 handler
+app.use((req, res) => {
+    res.status(404).json({ error: 'Route not found' });
+});
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+    console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+});
+//# sourceMappingURL=server.js.map
